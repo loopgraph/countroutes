@@ -6,7 +6,7 @@
 
     Date                 : September 2024
     Copyright            : (C) 2024 by Pavel Minin
-    Email                : countroutes@gmail.com
+    Email                : mininpa@gmail.com
 
 ****************************************************************************
  *                                                                         *
@@ -17,6 +17,7 @@
  *                                                                         *
  ***************************************************************************/
 """
+
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
@@ -26,6 +27,10 @@ from .CountRoutesMethods import CountRoutesMethods
 from .CountRoutesProvider import CountRoutesProvider
 from .BottleneckQuestAlgorithm import BottleneckQuestAlgorithm
 import os.path
+
+__license__ = 'GPL version 3'
+__copyright__ = 'Copyright 2024, Pavel Minin'
+__email__ = 'mininpa@gmail.com'
 
 pluginPath = os.path.split(os.path.dirname(__file__))[0]
 
@@ -186,3 +191,4 @@ class CountRoutesPlugin:
             processing.execAlgorithmDialog(self.alg)
         except:
             pass
+

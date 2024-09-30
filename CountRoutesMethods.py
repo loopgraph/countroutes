@@ -1,4 +1,22 @@
-""" Making CountRoutes Analysis Methods """
+# -*- coding: utf-8 -*-
+"""
+****************************************************************************
+    CountRoutesMethods.py
+    -------------------
+
+    Date                 : September 2024
+    Copyright            : (C) 2024 by Pavel Minin
+    Email                : mininpa@gmail.com
+
+****************************************************************************
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ ***************************************************************************/
+"""
 
 from PyQt5.QtCore import (
     QObject,
@@ -19,60 +37,6 @@ class CountRoutesMethods(QObject):
 
     def __init__(self):
         super().__init__()
-
-    @staticmethod
-    def getGraphBranches(graph, edgePairs):
-        leaves = deque(
-            filter(
-                lambda vertexId: len(graph.vertex(vertexId).outgoingEdges()) == 1,
-                range(graph.vertexCount())  # Vertex Id's
-            )
-        )
-        branches = set()
-        branchVertices = set()
-        while leaves:
-            vId = leaves.pop()
-            branchVertices.add(vId)
-            curEdges = [
-                it for it in graph.vertex(vId).outgoingEdges()
-                if it not in branches and it in edgePairs
-            ]
-            if curEdges:
-                singleEdgeId = curEdges[0]
-                branches = branches.union({singleEdgeId, edgePairs[singleEdgeId]})
-                nextVertexId = graph.edge(singleEdgeId).toVertex()
-                if nextVertexId not in branchVertices:
-                    edges = [
-                        eId for eId in graph.vertex(nextVertexId).outgoingEdges()
-                        if eId not in branches and eId in edgePairs
-                    ]
-                    if len(edges) == 1:
-                        leaves.append(nextVertexId)
-        return branches, branchVertices
-
-    @staticmethod
-    def getBottlenecksPoints(graph, edgePairs, circlesList, feedback, feedbackDelta, isBranches=False):
-        flashDelta = int(feedbackDelta / 3)
-        edges_full = deque([   # This is bottlenecks id edges (a pair of in- and out- orders)
-            eId for circles in circlesList for eIds in circles for eId in eIds
-            if eIds.count(edgePairs[eId]) > 0
-        ])
-        feedback.setProgress(feedback.progress() + flashDelta)
-        edges = set()
-        while edges_full:
-            eId = edges_full.pop()
-            if edgePairs[eId] in edges_full:
-                edges_full.remove(edgePairs[eId])
-            edges.add(eId)
-        feedback.setProgress(feedback.progress() + flashDelta)
-        if not isBranches:
-            branches, branchVertices = CountRoutesMethods.getGraphBranches(graph, edgePairs)
-            edges = edges.difference(branches)
-        feedback.setProgress(feedback.progress() + flashDelta)
-        return [
-            [graph.vertex(graph.edge(eId).fromVertex()).point(),
-             graph.vertex(graph.edge(eId).toVertex()).point()] for eId in edges
-        ]
 
     @staticmethod
     def composingCircleModel(graph, model, edgePairDict, feedback, feedbackDelta):
@@ -121,10 +85,11 @@ class CountRoutesMethods(QObject):
             while workStack and not workStack[-1]:
                 workStack.pop()
             restEdgesSet = eTotalSet.difference(ePassedSet)
-            flashCount = int((lastFlashCount - len(restEdgesSet)) / flashRate)
-            if flashCount:
-                lastFlashCount = len(restEdgesSet)
-                feedback.setProgress(feedback.progress() + flashCount)
+            if flashRate:
+                flashCount = int((lastFlashCount - len(restEdgesSet)) / flashRate)
+                if flashCount:
+                    lastFlashCount = len(restEdgesSet)
+                    feedback.setProgress(feedback.progress() + flashCount)
             if not workStack or not restEdgesSet:
                 resCirclesList.append(circles)
                 if restEdgesSet:  # Separate parts of the graph exist
@@ -165,6 +130,66 @@ class CountRoutesMethods(QObject):
         return builder.graph()
 
     @staticmethod
+    def composingOrderModelFromGraph(graph, edgePairs, feedback, feedbackDelta):
+        """
+        Composing orderModel with structure:
+        {inEdgeId: deque(sorted([outEdgeId]))}
+        where the list is sorted by clock wise order of outEdgeId according to inEdgeId
+        :return: orderModel
+        """
+        orderModel = dict()
+        lastFlashCount = 0
+        flashRate = int(graph.vertexCount() / feedbackDelta)
+        if graph.edgeCount() > 0:
+            for vId in range(graph.vertexCount()):
+                point = graph.vertex(vId).point()   # QgsPointXY
+                pointsDict = dict()
+                incomingEdges = [eId for eId in graph.vertex(vId).incomingEdges() if eId in edgePairs]
+                if len(incomingEdges) > 1:
+                    for inEdgeId in incomingEdges:
+                        nextPoint = graph.vertex(graph.edge(inEdgeId).fromVertex()).point()   # QgsPointXY
+                        # double (clockwise in degree, starting from north)
+                        pointsDict[inEdgeId] = point.azimuth(nextPoint)
+                    keyList = list(sorted(pointsDict.keys(), key=lambda it: pointsDict[it]))
+                    for idx, inEdgeId in enumerate(keyList):
+                        curList = [(idx + i) % len(keyList) for i in range(len(keyList))]
+                        orderModel[inEdgeId] = deque(
+                            [edgePairs[keyList[curList[i]]] for i in range(1, len(keyList))]
+                        )
+                elif len(incomingEdges) == 1:   # The end of a branch
+                    orderModel[incomingEdges[0]] = deque([edgePairs[incomingEdges[0]]])
+                if flashRate:
+                    flashCount = int((vId - lastFlashCount) / flashRate)
+                    if flashCount:
+                        lastFlashCount = vId
+                        feedback.setProgress(feedback.progress() + flashCount)
+        return orderModel
+
+    @staticmethod
+    def getBottlenecksPoints(graph, edgePairs, circlesList, feedback, feedbackDelta, isBranches=False):
+        flashDelta = int(feedbackDelta / 3)
+        edges_full = deque([   # This is bottlenecks id edges (a pair of in- and out- orders)
+            eId for circles in circlesList for eIds in circles for eId in eIds
+            if eIds.count(edgePairs[eId]) > 0
+        ])
+        feedback.setProgress(feedback.progress() + flashDelta)
+        edges = set()
+        while edges_full:
+            eId = edges_full.pop()
+            if edgePairs[eId] in edges_full:
+                edges_full.remove(edgePairs[eId])
+            edges.add(eId)
+        feedback.setProgress(feedback.progress() + flashDelta)
+        if not isBranches:
+            branches, branchVertices = CountRoutesMethods.getGraphBranches(graph, edgePairs)
+            edges = edges.difference(branches)
+        feedback.setProgress(feedback.progress() + flashDelta)
+        return [
+            [graph.vertex(graph.edge(eId).fromVertex()).point(),
+             graph.vertex(graph.edge(eId).toVertex()).point()] for eId in edges
+        ]
+
+    @staticmethod
     def getEdgePairDict(graph, feedback):
         if graph.edgeCount() == 0:
             return 0
@@ -201,36 +226,34 @@ class CountRoutesMethods(QObject):
         return edgePairs
 
     @staticmethod
-    def composingOrderModelFromGraph(graph, edgePairs, feedback, feedbackDelta):
-        """
-        Composing orderModel with structure:
-        {inEdgeId: deque(sorted([outEdgeId]))}
-        where the list is sorted by clock wise order of outEdgeId according to inEdgeId
-        :return: orderModel
-        """
-        orderModel = dict()
-        lastFlashCount = 0
-        flashRate = int(graph.vertexCount() / feedbackDelta)
-        if graph.edgeCount() > 0:
-            for vId in range(graph.vertexCount()):
-                point = graph.vertex(vId).point()   # QgsPointXY
-                pointsDict = dict()
-                incomingEdges = [eId for eId in graph.vertex(vId).incomingEdges() if eId in edgePairs]
-                if len(incomingEdges) > 1:
-                    for inEdgeId in incomingEdges:
-                        nextPoint = graph.vertex(graph.edge(inEdgeId).fromVertex()).point()   # QgsPointXY
-                        # double (clockwise in degree, starting from north)
-                        pointsDict[inEdgeId] = point.azimuth(nextPoint)
-                    keyList = list(sorted(pointsDict.keys(), key=lambda it: pointsDict[it]))
-                    for idx, inEdgeId in enumerate(keyList):
-                        curList = [(idx + i) % len(keyList) for i in range(len(keyList))]
-                        orderModel[inEdgeId] = deque(
-                            [edgePairs[keyList[curList[i]]] for i in range(1, len(keyList))]
-                        )
-                elif len(incomingEdges) == 1:   # The end of a branch
-                    orderModel[incomingEdges[0]] = deque([edgePairs[incomingEdges[0]]])
-                flashCount = int((vId - lastFlashCount) / flashRate)
-                if flashCount:
-                    lastFlashCount = vId
-                    feedback.setProgress(feedback.progress() + flashCount)
-        return orderModel
+    def getGraphBranches(graph, edgePairs):
+        leaves = deque(
+            filter(
+                lambda vertexId: len(
+                    [eId for eId in graph.vertex(vertexId).outgoingEdges() if eId in edgePairs]
+                ) == 1,
+                range(graph.vertexCount())  # Vertex Id's
+            )
+        )
+        branches = set()
+        branchVertices = set()
+        while leaves:
+            vId = leaves.pop()
+            branchVertices.add(vId)
+            curEdges = [
+                it for it in graph.vertex(vId).outgoingEdges()
+                if it not in branches and it in edgePairs
+            ]
+            if curEdges:
+                singleEdgeId = curEdges[0]
+                branches = branches.union({singleEdgeId, edgePairs[singleEdgeId]})
+                nextVertexId = graph.edge(singleEdgeId).toVertex()
+                if nextVertexId not in branchVertices:
+                    edges = [
+                        eId for eId in graph.vertex(nextVertexId).outgoingEdges()
+                        if eId not in branches and eId in edgePairs
+                    ]
+                    if len(edges) == 1:
+                        leaves.append(nextVertexId)
+        return branches, branchVertices
+

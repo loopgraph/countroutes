@@ -6,7 +6,7 @@
 
     Date                 : September 2024
     Copyright            : (C) 2024 by Pavel Minin
-    Email                : countroutes@gmail.com
+    Email                : mininpa@gmail.com
 
 ****************************************************************************
  *                                                                         *
@@ -17,6 +17,10 @@
  *                                                                         *
  ***************************************************************************/
 """
+
+__license__ = 'GPL version 3'
+__copyright__ = 'Copyright 2024, Pavel Minin'
+__email__ = 'mininpa@gmail.com'
 
 
 # noinspection PyPep8Naming
