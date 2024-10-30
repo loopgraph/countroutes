@@ -89,7 +89,7 @@ class BottleneckQuestAlgorithm(QgisAlgorithm):
             'Network Layer',
             [QgsProcessing.TypeVectorLine]
         ))
-        params = []
+        params = list()
         params.append(QgsProcessingParameterBoolean(
             self.IS_BRANCHES,
             'Find branches with leaves',
@@ -107,7 +107,7 @@ class BottleneckQuestAlgorithm(QgisAlgorithm):
 
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT,
-            'bnQuestResult',
+            'Bottleneck Quest',
             QgsProcessing.TypeVectorPolygon
         ))
 

@@ -28,7 +28,7 @@ __email__ = 'mininpa@gmail.com'
 
 class CountRoutesProvider(QgsProcessingProvider):
 
-    def __init__(self, providerIconPath,algIconPath, methods, alg):
+    def __init__(self, providerIconPath, algIconPath, methods, alg):
         QgsProcessingProvider.__init__(self)
         self.methods = methods
         self.iconPath = providerIconPath
@@ -36,10 +36,10 @@ class CountRoutesProvider(QgsProcessingProvider):
         self.alg = alg
 
     def id(self):
-        return 'bottleneckprovider'
+        return 'countroutes'
 
     def name(self):
-        return 'CountRoutes'
+        return 'countroutes'
 
     def icon(self):
         return QIcon(self.iconPath)

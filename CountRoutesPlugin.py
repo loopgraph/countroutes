@@ -34,6 +34,7 @@ __email__ = 'mininpa@gmail.com'
 
 pluginPath = os.path.split(os.path.dirname(__file__))[0]
 
+
 class CountRoutesPlugin:
     """QGIS Plugin Implementation."""
 
@@ -61,11 +62,11 @@ class CountRoutesPlugin:
             QCoreApplication.installTranslator(self.translator)
         # Declare instance attributes
         self.actions = []
-        self.menu = self.tr(u'&Count Routes')
+        self.menu = self.tr(u'&CountRoutes')
         # Check if plugin was started the first time in current QGIS session
         # Must be set in initGui() to survive plugin reloads
         self.first_start = None
-        self.proveder = None
+        self.provider = None
         self.alg = None
 
     # noinspection PyMethodMayBeStatic
@@ -93,7 +94,8 @@ class CountRoutesPlugin:
         add_to_toolbar=True,
         status_tip=None,
         whats_this=None,
-        parent=None):
+        parent=None
+    ):
         """Add a toolbar icon to the toolbar.
 
         :param icon_path: Path to the icon for this action. Can be a resource
@@ -152,7 +154,7 @@ class CountRoutesPlugin:
 
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
-        providerIconPath =  os.path.join(pluginPath, 'countroutes', 'img', 'icon_find_all.svg')
+        providerIconPath = os.path.join(pluginPath, 'countroutes', 'img', 'icon_find_all.svg')
         bqIconPath = os.path.join(pluginPath, 'countroutes', 'img', 'icon_find_narrow.svg')
         self.add_action(
             bqIconPath,
@@ -174,7 +176,7 @@ class CountRoutesPlugin:
         """Removes the plugin menu item and icon from QGIS GUI."""
         for action in self.actions:
             self.iface.removePluginMenu(
-                self.tr(u'&Count Routes'),
+                self.tr(u'&CountRoutes'),
                 action)
             self.iface.removeToolBarIcon(action)
         QgsApplication.processingRegistry().removeProvider(self.provider)
@@ -183,7 +185,7 @@ class CountRoutesPlugin:
         """Run method that performs all the real work"""
         # Create the dialog with elements (after translation) and keep reference
         # Only create GUI ONCE in callback, so that it will only load when the plugin is started
-        if self.first_start == True:
+        if self.first_start:
             self.first_start = False
             self.alg = BottleneckQuestAlgorithm()
             self.alg.setProvider(self.provider)

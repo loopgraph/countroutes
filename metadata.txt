@@ -1,0 +1,43 @@
+# This file contains metadata for your plugin.
+
+# This file should be included when you package your plugin.# Mandatory items:
+
+[general]
+name=Count Routes
+qgisMinimumVersion=3.18
+qgisMaximumVersion=3.99
+description=This plugin provides algorithms of network analysis
+version=1.0.0
+author=Pavel Minin
+email=mininpa@gmail.com
+
+about=The CountRoutes plugin provides algorithms of network analysis. The first release consists of an algorithm of bottleneck searching. It enables to find: - line sections with two endpoints connecting network circle segments, - blind pass branches.
+
+# End of mandatory metadata
+
+# Recommended items:
+
+hasProcessingProvider=no
+# Uncomment the following line and add your changelog:
+# changelog=
+
+# Tags are comma separated with spaces allowed
+tags=network analysis, graph analysis, bottlenecks, network branches
+
+homepage=https://loopgraph.github.io
+tracker=https://github.com/loopgraph/countroutes/issues
+repository=https://github.com/loopgraph/countroutes
+category=Plugins
+icon=icon_find_all.svg
+# experimental flag
+experimental=True
+
+#set processing provider flag
+hasProcessingProvider=yes
+
+# deprecated flag (applies to the whole plugin, not just a single version)
+deprecated=False
+
+# If the plugin can run on QGIS Server.
+server=False
+
