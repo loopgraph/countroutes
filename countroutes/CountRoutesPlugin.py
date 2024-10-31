@@ -154,8 +154,8 @@ class CountRoutesPlugin:
 
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
-        providerIconPath = os.path.join(pluginPath, 'countroutes', 'img', 'icon_find_all.svg')
-        bqIconPath = os.path.join(pluginPath, 'countroutes', 'img', 'icon_find_narrow.svg')
+        providerIconPath = os.path.join(pluginPath, '', 'countroutes/img', 'icon_find_all.svg')
+        bqIconPath = os.path.join(pluginPath, '', 'countroutes/img', 'icon_find_narrow.svg')
         self.add_action(
             bqIconPath,
             text=self.tr(u'Bottleneck Quest'),
