@@ -29,28 +29,45 @@ from qgis.utils import iface
 from qgis.PyQt.QtWidgets import (
     QWidget,
     QTableView,
+    QHeaderView,
     QSizePolicy,
     QHBoxLayout,
     QVBoxLayout,
     QMenu,
+    QToolBar,
     QToolButton,
+    QAction,
     QLabel,
     QFrame,
+    QStackedWidget,
 )
 from qgis.PyQt.QtCore import (
     pyqtSignal,
     QModelIndex,
     Qt,
     QPoint,
+    QPropertyAnimation,
+    QParallelAnimationGroup,
+    QRect,
+    QElapsedTimer,
+    QTimer,
+    QEvent,
+    QCoreApplication,
 )
 from qgis.PyQt.QtGui import (
-    #QColor,
+    QColor,
     QCursor,
     #QPainter,
     QFont,
     QPalette,
     QFontMetrics
 )
+from collections import namedtuple
+
+
+class PaintDoneEvent(QEvent):
+    def __init__(self):
+        super().__init__(QEvent.Type(QEvent.User + 1))
 
 
 class ProfileTable(QTableView):
@@ -59,6 +76,8 @@ class ProfileTable(QTableView):
     showTooltips = pyqtSignal()
     hideTooltips = pyqtSignal()
     activateScaleBtn = pyqtSignal(bool)
+    showObject = pyqtSignal()
+    paintingFinished = pyqtSignal()
 
     def __init__(self, model, delegate, width, height, parent=None):
         super().__init__(parent)
@@ -208,164 +227,162 @@ class ProfileTable(QTableView):
 class CrayonContainer(QWidget):
     def __init__(self, profile, model, delegate, parent=None):
         super().__init__(parent)
+        # self.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+        # bgColor = QColor(profile.bgColor)
+        # self.setStyleSheet(f"background-color: {bgColor.name()};")
+        self.timer1 = QElapsedTimer()
+        self.showCount = 0
+
+        self.yLabelsLevel = self.yTooltipPositions = self.xLabelsLevel = self.xTooltipPositions = None
         self.profile = profile
+        # Widget font settings
         self.labelFont = QFont(profile.FONT_FAMILY, profile.LABEL_POINT_SIZE, weight=profile.LABEL_WEIGHT)
         fm = QFontMetrics(self.labelFont)
         self.labelHeight = fm.height() + 2
-        self.headerFont = QFont(profile.FONT_FAMILY, profile.INFO_SIZE, weight=profile.HEADER_WEIGHT)
-        fm = QFontMetrics(self.headerFont)
-        self.headerHeight = fm.height() + 2
-        self.infoFont = QFont(profile.FONT_FAMILY, profile.INFO_SIZE, weight=profile.INFO_WEIGHT)
-        fm = QFontMetrics(self.infoFont)
-        self.infoHeight = fm.height()
-        self.hintFont = QFont(profile.FONT_FAMILY, profile.HINT_SIZE, weight=profile.HINT_WEIGHT)
-        fm = QFontMetrics(self.infoFont)
-        self.hintHeight = fm.height()
-        # self.scaleBtn = Switcher(self)
-        self.activateScaleBtn(False)
+        # Init hover and un-hover palette for labels
+        self.hPalette = self.initHPalette(profile)
+        # Table View constructing
         self.view = ProfileTable(model, delegate, profile.width(), profile.height(), parent=self)
-        self.view.isHover.connect(self.changeLabelsColor)
-        self.hoverPalette = QPalette()
-        self.hoverPalette.setColor(QPalette.WindowText, profile.lbHoverColor)
-        self.hoverPalette.setColor(QPalette.Window, profile.bgColor)
-        self.unhoverPalette = QPalette()
-        self.unhoverPalette.setColor(QPalette.WindowText, profile.lbUnhoverColor)
-        self.unhoverPalette.setColor(QPalette.Window, profile.bgColor)
-        self.xScale, self.yScale, self.xName, self.yName = self.initLabels()
+        # Placeholder constructing
+        placeholder = self.createPlaceholder(profile)
+
+        # Creating axis data based on profile points
+        self.xScale, self.yScale, self.xName, self.yName = self.initLabels(profile)
+
+        # Creating profile frame with stacked widget with placeholder and tableview
+        stackedWidget = QStackedWidget()
+        # Making horizontal layout box with parts of profile widgets
+        profileLayout = self.lineup(profile, stackedWidget)
+        # Making horizontal layout box with details information widgets
+        infoLayout = self.setupDetails(profile)
+        # Creating QFrame of profile page
+        self.profileFrame = ProfileFrame(
+            stackedWidget,
+            placeholder,
+            self.view,
+            profileLayout,
+            infoLayout
+        )
+        self.profileFrame.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+        bgColor = QColor(profile.bgColor)
+        self.profileFrame.setStyleSheet(f"background-color: {bgColor.name()};")
+
+        # Creating main layout
         mainLayout = QVBoxLayout()
-        gLayout = self.lineup()
-        mainLayout.addLayout(gLayout)
-        toolBar = self.setToolBar()
-        mainLayout.addWidget(toolBar, 0, Qt.AlignLeft | Qt.AlignTop)
-        hLaneLine = HLaneLine()
-        mainLayout.addWidget(hLaneLine, 0, Qt.AlignTop)
-        infoLayout = self.makingup()
-        self.updateCommonData()
-        mainLayout.addLayout(infoLayout)
+        mainLayout.addWidget(self.profileFrame, 0, Qt.AlignTop)
         mainLayout.addStretch()
-        mainLayout.setSpacing(0)
         self.setLayout(mainLayout)
+
+        # Creating Y- and X- tooltip red labels
         self.yTooltipLabel = self.initTooltip(profile.Y_LABEL_WIDTH)
         self.xTooltipLabel = self.initTooltip(profile.X_LABEL_WIDTH)
-        self.leftIndent = 0
-        self.topIndent = 0
+        self.hideTooltips()
 
+        # Connecting mouse events on table view with data updaters
+        self.view.isHover.connect(self.changeLabelsColor)
         self.view.tooltipData.connect(self.updateTooltips)
         self.view.tooltipData.connect(self.updateCurrentData)
         self.view.showTooltips.connect(self.showTooltips)
         self.view.hideTooltips.connect(self.hideTooltips)
         self.view.hideTooltips.connect(self.hideCurrentData)
         self.view.activateScaleBtn.connect(self.activateScaleBtn)
-        # self.scaleBtn.lazyClicked.connect(self.scaleCurve)
+        self.profileFrame.setTooltipsPositions.connect(self.setPositionsData)
 
-        self.hideTooltips()
-        # self.updateView()
-        # point = self.view.mapToParent(QPoint(0, 0))
-        # print(f'Left top point: x={point.x()}, y={point.y()}')
-        # print(f'view geometry = {self.view.geometry()}')
-        # print(f'view minimumWidth = {self.view.minimumWidth()}')
-        # print(f'view  minimumHeight = {self.view. minimumHeight()}')
+    @staticmethod
+    def createPlaceholder(profile):
+        placeholder = QLabel()
+        placeholder.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        pixmap = profile.getPixmapFromData(profile.paintData, profile.width(), profile.height())
+        # if pixmap is not None:
+        # print('pixmap is OK')
+        placeholder.setPixmap(pixmap)
+        placeholder.setFixedWidth(pixmap.width())
+        placeholder.setFixedHeight(pixmap.height())
+        return placeholder
 
-    def lineup(self):
+    @staticmethod
+    def initHPalette(profile):
+        hoverPalette = QPalette()
+        hoverPalette.setColor(QPalette.WindowText, profile.lbHoverColor)
+        hoverPalette.setColor(QPalette.Window, profile.bgColor)
+        unHoverPalette = QPalette()
+        unHoverPalette.setColor(QPalette.WindowText, profile.lbUnhoverColor)
+        unHoverPalette.setColor(QPalette.Window, profile.bgColor)
+        return namedtuple('HPalette', 'hoverPalette unHoverPalette')(
+            hoverPalette,
+            unHoverPalette
+        )
+
+    def lineup(self, profile, stackedWidget):
         vLayout = QVBoxLayout()
         curV = - int(self.labelHeight / 2)
         for idx, it in enumerate(self.yScale):
-            vLayout.addSpacing(self.profile.hCharts[idx] - curV - self.labelHeight)
+            vLayout.addSpacing(profile.hCharts[idx] - curV - self.labelHeight)
             vLayout.addWidget(it, 0, Qt.AlignRight)
-            curV = self.profile.hCharts[idx]
-        vLayout.addSpacing(self.profile.height() - curV - int(self.labelHeight * 1.5))
+            curV = profile.hCharts[idx]
+        vLayout.addSpacing(profile.height() - curV - int(self.labelHeight * 1.5))
         vLayout.addWidget(self.yName, 0, Qt.AlignRight)
+        vLayout.addStretch()
         vLayout.setSpacing(0)
         xLayout = QHBoxLayout()
         xLayout.addWidget(self.xName, 0, Qt.AlignLeft)
-        curV = self.profile.NAME_WIDTH
+        curV = profile.NAME_WIDTH
         for it in self.xScale:
-            xLayout.addSpacing(self.profile.DELTA_X - curV - int(self.profile.X_LABEL_WIDTH / 2))
+            xLayout.addSpacing(profile.DELTA_X - curV - int(profile.X_LABEL_WIDTH / 2))
             xLayout.addWidget(it, 0, Qt.AlignLeft)
-            curV = int(self.profile.X_LABEL_WIDTH / 2)
+            curV = int(profile.X_LABEL_WIDTH / 2)
         xLayout.addStretch()
         xLayout.setSpacing(0)
         graphLayout = QVBoxLayout()
-        graphLayout.setAlignment(Qt.AlignLeft)
-        graphLayout.addWidget(self.view)
-        graphLayout.addSpacing(self.profile.X_LABEL_TOP_INDENT)
+        graphLayout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        graphLayout.addSpacing(profile.X_LABEL_TOP_INDENT)
+        graphLayout.addWidget(stackedWidget)
         graphLayout.addLayout(xLayout)
         hLayout = QHBoxLayout()
-        hLayout.addSpacing(self.profile.Y_LABEL_LEFT_INDENT)
+        hLayout.addSpacing(profile.Y_LABEL_LEFT_INDENT)
         hLayout.addLayout(vLayout)
-        hLayout.addSpacing(self.profile.Y_LABEL_RIGHT_INDENT)
+        hLayout.addSpacing(profile.Y_LABEL_RIGHT_INDENT)
         hLayout.addLayout(graphLayout)
         hLayout.addStretch()
         hLayout.setSpacing(0)
         return hLayout
 
-    def setToolBar(self):
-        """
-        toolBar = QToolBar()
-        loadBtn = QToolButton()
-        menuLoad = QMenu()
-        layersAct = menuLoad.addMenu('Layers')
-        filesAct = menuLoad.addMenu('Files')
-        loadBtn.setPopupMode(QToolButton.InstantPopup)
-        loadBtn.setMenu(menuLoad)
-        loadBtn.setText('Load')
-        toolBar.addWidget(loadBtn)
-        menuLoad.setTitle('Load')
-        #menuLoad.showTearOffMenu()
-        menuLoad.setToolTipsVisible(True)
-        """
-        self.menuLoad = QMenu('Load')
-        layersAct = self.menuLoad.addMenu('Layers')
-        filesAct = self.menuLoad.addMenu('Files')
-        toolButton = QToolButton()
-        # self.menuAction = QAction("Load", self)
-        # self.menuAction.setMenu(self.menuLoad)
-        # self.menuAction.triggered.connect(self.show_menu)
-        # toolButton.setMenu(self.menuLoad)
-        toolButton.setPopupMode(QToolButton.InstantPopup)
-        # self.menuLoad.setVisible(True)
-        toolButton.setText('Load')
-        toolButton.clicked.connect(self.show_menu)
-        # self.menuPoint = toolButton.pos()
-        return toolButton
-
-    def show_menu(self):
-        # self.menuLoad.show()
-        # self.menuLoad.popup(self.mapToGlobal(self.menuAction.toolBar().widgetForAction(self.menuAction).pos()))
-        # self.menuLoad.popup(self.mapToGlobal(self.menuPoint))
-        self.menuLoad.move(QCursor.pos())
-        self.menuLoad.show()
-
-    def makingup(self):
+    def setupDetails(self, profile):
+        headerFont = QFont(profile.FONT_FAMILY, profile.INFO_SIZE, weight=profile.HEADER_WEIGHT)
+        fm = QFontMetrics(headerFont)
+        headerHeight = fm.height() + 2
+        infoFont = QFont(profile.FONT_FAMILY, profile.INFO_SIZE, weight=profile.INFO_WEIGHT)
+        fm = QFontMetrics(infoFont)
+        infoHeight = fm.height()
         infoLayout = QHBoxLayout()
         vLayout = QVBoxLayout()
         capture = CrayonLabel(
             parent=self,
-            palette=self.unhoverPalette,
-            font=self.headerFont,
-            text=self.profile.headerData['Current'],
-            height=self.headerHeight,
+            palette=self.hPalette.unHoverPalette,
+            font=headerFont,
+            text=profile.headerData['Current'],
+            height=headerHeight,
             align=Qt.AlignLeft
         )
         vLayout.addWidget(capture, 0, Qt.AlignLeft | Qt.AlignTop)
-        for txt in self.profile.infoData['Current']:
+        for txt in profile.infoData['Current']:
             name = CrayonLabel(
                 parent=self,
-                palette=self.unhoverPalette,
-                font=self.infoFont,
+                palette=self.hPalette.unHoverPalette,
+                font=infoFont,
                 text=txt,
-                height=self.infoHeight,
+                height=infoHeight,
                 align=Qt.AlignLeft
             )
             data = CrayonLabel(
                 parent=self,
-                palette=self.unhoverPalette,
-                font=self.infoFont,
+                palette=self.hPalette.unHoverPalette,
+                font=infoFont,
                 text='',
-                height=self.infoHeight,
+                height=infoHeight,
                 align=Qt.AlignRight
             )
-            self.profile.infoData['Current'][txt] = data
+            profile.infoData['Current'][txt] = data
             hLayout = QHBoxLayout()
             hLayout.addWidget(name, 0, Qt.AlignLeft)
             hLayout.addStretch()
@@ -379,36 +396,54 @@ class CrayonContainer(QWidget):
         vLayout = QVBoxLayout()
         capture = CrayonLabel(
             parent=self,
-            palette=self.unhoverPalette,
-            font=self.headerFont,
-            text=self.profile.headerData['Total'],
-            height=self.headerHeight,
+            palette=self.hPalette.unHoverPalette,
+            font=headerFont,
+            text=profile.headerData['Total'],
+            height=headerHeight,
             align=Qt.AlignLeft
         )
         vLayout.addWidget(capture, 0, Qt.AlignLeft)
-        for txt in self.profile.infoData['Common']:
+        for txt in profile.infoData['Common']:
             name = CrayonLabel(
                 parent=self,
-                palette=self.unhoverPalette,
-                font=self.infoFont,
+                palette=self.hPalette.unHoverPalette,
+                font=infoFont,
                 text=txt,
-                height=self.infoHeight,
+                height=infoHeight,
                 align=Qt.AlignLeft
             )
             data = CrayonLabel(
                 parent=self,
-                palette=self.unhoverPalette,
-                font=self.infoFont,
+                palette=self.hPalette.unHoverPalette,
+                font=infoFont,
                 text='',
-                height=self.infoHeight,
+                height=infoHeight,
                 align=Qt.AlignRight
             )
-            self.profile.infoData['Common'][txt] = data
+            profile.infoData['Common'][txt] = data
             hLayout = QHBoxLayout()
             hLayout.addWidget(name, 0, Qt.AlignLeft)
             hLayout.addStretch()
             hLayout.addWidget(data, 0, Qt.AlignRight)
             vLayout.addLayout(hLayout)
+        profile.infoData['Common']['Max Elevation'].setText(
+            f"{profile.Y_DATA_FORMAT}".format(profile.maxElevation)
+        )
+        profile.infoData['Common']['Min Elevation'].setText(
+            f"{profile.Y_DATA_FORMAT}".format(profile.minElevation)
+        )
+        profile.infoData['Common']['Proj Distance'].setText(
+            f"{profile.X_DATA_FORMAT}".format(profile.distance)
+        )
+        profile.infoData['Common']['Reckoning'].setText(
+            f"{profile.X_DATA_FORMAT}".format(profile.points[-1].log)
+        )
+        profile.infoData['Common']['Max Gradient'].setText(
+            f"{profile.G_DATA_FORMAT}".format(profile.maxGradient)
+        )
+        profile.infoData['Common']['Min Gradient'].setText(
+            f"{profile.G_DATA_FORMAT}".format(profile.minGradient)
+        )
         # vLayout.setSpacing(0)
         infoLayout.addLayout(vLayout)
         infoLayout.setSpacing(0)
@@ -420,10 +455,11 @@ class CrayonContainer(QWidget):
     def initTooltip(self, width):
         tooltipLabel = QLabel(self)
         tooltipLabel.setAutoFillBackground(True)
-        tooltipLabel.setPalette(self.unhoverPalette)
+        tooltipLabel.setPalette(self.hPalette.unHoverPalette)
         tooltipLabel.setFont(self.labelFont)
         tooltipLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        tooltipLabel.setFixedWidth(self.profile.Y_LABEL_WIDTH)
+        # tooltipLabel.setFixedWidth(self.profile.Y_LABEL_WIDTH)
+        tooltipLabel.setFixedWidth(width)
         tooltipLabel.setObjectName("Tooltip")
         tooltipLabel.setStyleSheet(
             "#Tooltip { border: 1px solid red; }"
@@ -431,21 +467,21 @@ class CrayonContainer(QWidget):
         tooltipLabel.setWindowFlags(Qt.Popup | Qt.ToolTip)
         return tooltipLabel
 
-    def initLabels(self):
-        axisData = self.profile.getAxisData(self.profile.MAX_COLUMNS, 0)
+    def initLabels(self, profile):
+        axisData = profile.getAxisData(profile.MAX_COLUMNS, 0)
         xLabels = []
         yLabels = []
         names, crossXY = [None, None], None
         if axisData is not None:
             pt = iface.mainWindow().palette()
-            pt.setColor(QPalette.Window, self.profile.bgSubseaColor)
+            pt.setColor(QPalette.Window, profile.bgSubseaColor)
             for row, labelText in axisData.yData.items():
                 label = CrayonLabel(
                     parent=self,
-                    palette=self.unhoverPalette,
+                    palette=self.hPalette.unHoverPalette,
                     font=self.labelFont,
                     text=labelText,
-                    width=self.profile.Y_LABEL_WIDTH,
+                    width=profile.Y_LABEL_WIDTH,
                     height=self.labelHeight,
                     align=Qt.AlignRight | Qt.AlignVCenter
                 )
@@ -453,10 +489,10 @@ class CrayonContainer(QWidget):
             for col, labelText in axisData.xData.items():
                 label = CrayonLabel(
                     parent=self,
-                    palette=self.unhoverPalette,
+                    palette=self.hPalette.unHoverPalette,
                     font=self.labelFont,
                     text=labelText,
-                    width=self.profile.X_LABEL_WIDTH,
+                    width=profile.X_LABEL_WIDTH,
                     height=self.labelHeight,
                     align=Qt.AlignCenter | Qt.AlignHCenter
                 )
@@ -465,10 +501,10 @@ class CrayonContainer(QWidget):
             for labelText in [axisData.xName, axisData.yName]:
                 label = CrayonLabel(
                     parent=self,
-                    palette=self.unhoverPalette,
+                    palette=self.hPalette.unHoverPalette,
                     font=self.labelFont,
                     text=labelText,
-                    width=self.profile.NAME_WIDTH,
+                    width=profile.NAME_WIDTH,
                     height=self.labelHeight,
                     align=Qt.AlignHCenter
                 )
@@ -492,36 +528,23 @@ class CrayonContainer(QWidget):
     def changeLabelsColor(self, isHover):
         if isHover:
             for label in self.yScale:
-                label.setPalette(self.hoverPalette)
+                label.setPalette(self.hPalette.hoverPalette)
             for label in self.xScale:
-                label.setPalette(self.hoverPalette)
+                label.setPalette(self.hPalette.hoverPalette)
         else:
             for label in self.yScale:
-                label.setPalette(self.unhoverPalette)
+                label.setPalette(self.hPalette.unHoverPalette)
             for label in self.xScale:
-                label.setPalette(self.unhoverPalette)
-
-    def updateCommonData(self):
-        self.profile.infoData['Common']['Max Elevation'].setText(
-            f"{self.profile.Y_DATA_FORMAT}".format(self.profile.maxElevation)
-        )
-        self.profile.infoData['Common']['Min Elevation'].setText(
-            f"{self.profile.Y_DATA_FORMAT}".format(self.profile.minElevation)
-        )
-        self.profile.infoData['Common']['Proj Distance'].setText(
-            f"{self.profile.X_DATA_FORMAT}".format(self.profile.distance)
-        )
-        self.profile.infoData['Common']['Reckoning'].setText(
-            f"{self.profile.X_DATA_FORMAT}".format(self.profile.points[-1].log)
-        )
-        self.profile.infoData['Common']['Max Gradient'].setText(
-            f"{self.profile.G_DATA_FORMAT}".format(self.profile.maxGradient)
-        )
-        self.profile.infoData['Common']['Min Gradient'].setText(
-            f"{self.profile.G_DATA_FORMAT}".format(self.profile.minGradient)
-        )
+                label.setPalette(self.hPalette.unHoverPalette)
 
     def updateTooltips(self, index):
+        # if any([it is None for it in (
+        #         self.yLabelsLevel,
+        #         self.yTooltipPositions,
+        #         self.xLabelsLevel,
+        #         self.xTooltipPositions
+        # )]):
+        #     return
         point = self.view.model().getToolTipData(index)
         if not point or len(point.data.row) == 0:
             print(f'updateTooltips: hide tooltips, index = ({index.column()}, {index.row()})')
@@ -529,12 +552,12 @@ class CrayonContainer(QWidget):
             # self.xTooltipLabel.hide()
             return
         for elv in point.data.row: break
-        self.yTooltipLabel.move(self.mapToGlobal(QPoint(
+        self.yTooltipLabel.move(self.view.mapToGlobal(QPoint(
             self.yLabelsLevel,
             self.yTooltipPositions[elv] + self.profile.BOTTOM_SPACE
         )))
         self.yTooltipLabel.setText(f"{self.profile.Y_TIP_FORMAT}".format(point.data.elevation[0]))
-        self.xTooltipLabel.move(self.mapToGlobal(QPoint(
+        self.xTooltipLabel.move(self.view.mapToGlobal(QPoint(
             self.xTooltipPositions[index.column()],
             self.xLabelsLevel
         )))
@@ -570,24 +593,13 @@ class CrayonContainer(QWidget):
         self.yTooltipLabel.show()
         self.xTooltipLabel.show()
 
-    def positionsData(self):
-        self.leftIndent = self.view.geometry().topLeft().x()
-        self.rightIndent = self.view.geometry().topRight().x()
-        self.topIndent = self.view.geometry().topLeft().y()
-        self.bottomIndent = self.view.geometry().bottomLeft().y()
+    def setPositionsData(self):
         self.xLabelsLevel = self.view.geometry().bottomLeft().y() + 2
         self.yLabelsLevel = self.view.geometry().topLeft().x() - self.yTooltipLabel.geometry().width() - 1
         self.yTooltipPositions = [
             row + self.view.geometry().topLeft().y() - int(self.yTooltipLabel.geometry().height() / 2)
             for row in range(self.view.model().rowCount())
         ]
-        """
-        self.yLabelPositions = [
-            row + self.view.geometry().topLeft().y() - int(self.yScale[idx].geometry().height() / 2)  
-            for idx, row in enumerate(self.profile.hCharts)
-        ]
-        #print(f'yLabelPositions = {self.yLabelPositions}')
-        """
         rightColumnLimit = self.view.model().columnCount() - \
                            int(self.xTooltipLabel.geometry().width() / 2)
         rightLimit = self.view.geometry().topLeft().x() + self.view.model().columnCount() - \
@@ -598,6 +610,12 @@ class CrayonContainer(QWidget):
              ) if column < rightColumnLimit else rightLimit
             for column in range(self.view.model().columnCount())
         ]
+        print(
+            'yTooltipLabel: '
+            f'view.x = {self.view.geometry().topLeft().x()} '
+            f',width = {self.yTooltipLabel.geometry().width()}, x = {self.yLabelsLevel}'
+        )
+
 
     def hideTooltips(self):
         print('hideTooltips')
@@ -617,87 +635,12 @@ class CrayonContainer(QWidget):
         # self.scaleBtn.setEnabled(status)
         print(f'scaleBtn status = {status}')
 
-
-class ClassMenu(QMenu):
-    def __init__(self, parent):
-        super().__init__(parent)
-        class_A = self.addMenu("ClassA")
-        class_A1 = class_A.addAction("ClassA1")
-        class_A2 = class_A.addMenu("ClassA2")
-        class_A3 = class_A2.addAction("ClassA3")
-
-        class_A1.triggered.connect(self.onActionClicked)
-        class_A3.triggered.connect(self.onActionClicked)
-
-        print(class_A.menuAction())
-
-    def onActionClicked(self):
-        print(self.sender().text())
-
-    def onMenuClicked(self, menu):
-        print(menu.title())
-
-    def mousePressEvent(self, event):
-        super().mousePressEvent(event)
-        action = self.actionAt(event.pos())
-        if not action:
-            return
-        menu = action.menu()
-        if menu:
-            self.onMenuClicked(menu)
-
-    """
-    def setVisible(self, visible):
-        // Don't hide the menu when holding Shift down
-        if (!visible && self.activeAction()):
-            if (QApplication::queryKeyboardModifiers().testFlag(Qt::ShiftModifier))
-                return
-        super(ClassMenu, self).setVisible(visible)
-    """
-
-"""
-class ProxyModel(QAbstractProxyModel):
-    def __init__(self, data, placeholderText='-- Select Data --', parent=None):
-        super().__init__(parent)
-        self._placeholderText = placeholderText
-        self.setNewModel(data)
-
-    def index(self, row: int, column: int, parent: QModelIndex = ...) -> QModelIndex:
-        return self.createIndex(row, column)
-
-    def parent(self, index: QModelIndex = ...) -> QModelIndex:
-        return QModelIndex()
-
-    def rowCount(self, parent: QModelIndex = ...) -> int:
-        return self.sourceModel().rowCount() + 1 if self.sourceModel() else 0
-
-    def columnCount(self, parent: QModelIndex = ...) -> int:
-        return self.sourceModel().columnCount() if self.sourceModel() else 0
-
-    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
-        if index.row() == 0 and role == Qt.DisplayRole:
-            return self._placeholderText
-        elif index.row() == 0 and role in {Qt.EditRole, Qt.DisplayRole}:
-            return None
+    def toggleFrames(self):
+        if not self.dataFrame.isHidden():
+            self.stackedFrame.setCurrentWidget(self.profileFrame)
         else:
-            return super().data(index, role)
+            self.stackedFrame.setCurrentWidget(self.dataFrame)
 
-    def mapFromSource(self, sourceIndex: QModelIndex):
-        return self.index(sourceIndex.row() + 1, sourceIndex.column())
-
-    def mapToSource(self, proxyIndex: QModelIndex):
-        return self.sourceModel().index(proxyIndex.row() - 1, proxyIndex.column())
-
-    def setNewModel(self, data: list):
-        comboModel = QStandardItemModel()
-        for i, (name, layerId) in enumerate(data):
-            item = QStandardItem(f"{name}")
-            item.setData(layerId, Qt.UserRole)
-            comboModel.appendRow(item)
-        self.beginResetModel()
-        self.setSourceModel(comboModel)
-        self.endResetModel()
-"""
 
 class HLaneLine(QFrame):
     def __init__(self, parent=None):
@@ -735,3 +678,78 @@ class CrayonLabel(QLabel):
             self.setFixedHeight(height)
         if align is not None:
             self.setAlignment(align)
+
+
+class ProfileFrame(QFrame):
+    setTooltipsPositions = pyqtSignal()
+
+    def __init__(
+            self,
+            stackedWidget,
+            placeholder,
+            bigView,
+            profileLayout,
+            infoLayout,
+            parent=None
+    ):
+        super().__init__(parent)
+        self.isPaintingFinished = False
+        self.stackedWidget = stackedWidget
+        self.placeholder = placeholder
+        self.bigView = bigView
+        self.isStackedWidgetDestroyed = False
+        self.stackedWidget.addWidget(bigView)
+        self.stackedWidget.addWidget(placeholder)
+        self.stackedWidget.setCurrentWidget(self.placeholder)
+        self.stackedWidget.destroyed.connect(self.stackedWidgetDestroyed)
+        frameLayout = QVBoxLayout()
+        frameLayout.addLayout(profileLayout)
+        # hLaneLine = HLaneLine()
+        # frameLayout.addWidget(hLaneLine, 0, Qt.AlignTop)
+        frameLayout.addLayout(infoLayout)
+        frameLayout.addStretch()
+        frameLayout.setSpacing(0)
+        self.setLayout(frameLayout)
+
+    def stackedWidgetDestroyed(self):
+        self.isStackedWidgetDestroyed = True
+
+    def showEvent(self, event):
+        self.isPaintingFinished = False
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        print('startFrameHiding run')
+        try:
+            QTimer.singleShot(
+                5,
+                Qt.PreciseTimer,
+                self.showPlaceholder
+            )
+        except:
+            pass
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isPaintingFinished:
+            self.isPaintingFinished = True
+            print('start show bigView')
+            try:
+                QTimer.singleShot(
+                    20,
+                    Qt.PreciseTimer,
+                    self.showBigView
+                )
+                self.setTooltipsPositions.emit()
+            except:
+                pass
+
+    def showBigView(self):
+        if not self.isStackedWidgetDestroyed:
+            self.stackedWidget.setCurrentWidget(self.bigView)
+
+    def showPlaceholder(self):
+        if not self.isStackedWidgetDestroyed:
+            self.stackedWidget.setCurrentWidget(self.placeholder)
+

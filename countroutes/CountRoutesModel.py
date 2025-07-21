@@ -36,6 +36,9 @@ from PyQt5.QtCore import (
 )
 from qgis.PyQt.QtGui import (
     QFont,
+    QColor,
+    QImage,
+    QPixmap,
 )
 import math
 import traceback
@@ -83,6 +86,9 @@ class Crayon:
     G_DATA_FORMAT: str = "{: 2.2f} °"
     subseaRow: float = float('inf')
     MINIMAL_SELECTED_COLUMNS: int = 4
+    dataFrameName: str = "Data"
+    profileFrameName: str = "Profile"
+    timeSliding: int = 500  # time in ms
     LABEL_WEIGHT: QFont.Weight = field(default_factory=lambda: QFont.Medium)
     HEADER_WEIGHT: QFont.Weight = field(default_factory=lambda: QFont.Bold)
     INFO_WEIGHT: QFont.Weight = field(default_factory=lambda: QFont.Normal)
@@ -360,6 +366,27 @@ class Crayon:
                     else:
                         paintData[column, row] = (-2, self.bgAboveColor)
         return paintData
+
+    @staticmethod
+    def getPixmapFromData(data, width, height):
+        pixelDataRGB = []
+        alpha = 255
+        try:
+            for row in range(height):
+                for column in range(width):
+                    color = QColor(data[column, row][1])
+                    # pixelDataRGB.extend([alpha, color.red(), color.green(), color.blue()])
+                    pixelDataRGB.extend([color.blue(), color.green(), color.red(), alpha])
+            print(f'pixelDataSize = {len(pixelDataRGB)}')
+            byteDataRGB = bytes(pixelDataRGB)
+            image = QImage(byteDataRGB, width, height, width * 4, QImage.Format_ARGB32)
+            print(f'image is NULL = {image.isNull()}')
+            return QPixmap.fromImage(image)
+        except:
+            ex = "{0}".format(traceback.format_exc())
+            msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
+            print(msg)
+            return None
 
     def row(self, col):
         try:
