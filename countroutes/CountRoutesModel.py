@@ -45,7 +45,7 @@ import traceback
 from PyQt5.QtWidgets import (
     QAbstractItemDelegate,
 )
-
+from qgis.core import QgsLineString
 
 @dataclass
 class Crayon:
@@ -216,7 +216,7 @@ class Crayon:
                 row == self.height() - 1
         )
 
-    def loadPoints(self, points):
+    def loadPoints(self, points, curve):
         """
             input points is a list of pairs: dX, Y
             where dX is a distance between current point and previous left point,
@@ -236,7 +236,16 @@ class Crayon:
                 haul        = (current Y - next Y) / math.sin(math.radians(gradient))
                 log         = a sum of previous and current hauls
         """
+        if (points is None and curve is None or points is not None and curve is not None or
+                points is None and
+                (not isinstance(curve, QgsLineString) or curve.numPoints() < 2)
+        ):
+            return False
         try:
+            if points is None:
+                points = [(0.0, curve.pointN(0).z())]
+                for p1, p2 in [(curve.pointN(i), curve.pointN(i + 1)) for i in range(curve.numPoints() - 1)]:
+                    points.append(p1.distance(p2), p2.z())
             self.points = []
             if (not points or not isinstance(points, list) or
                     len(points) < 2 or
