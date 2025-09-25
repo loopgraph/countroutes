@@ -23,7 +23,12 @@ The module declares following classes:
     ProfileModel(QAbstractTableModel)
     ProfileDelegate(QAbstractItemDelegate)
 """
-from qgis.core import QgsLineString
+from qgis.core import (
+    QgsLineString,
+    QgsGeometry,
+    QgsDistanceArea,
+    QgsPointXY,
+)
 from dataclasses import dataclass, field
 from qgis.PyQt.QtGui import (
     QFont,
@@ -45,6 +50,7 @@ from qgis.PyQt.QtCore import (
     QModelIndex,
     QTimer,
     QPoint,
+    QByteArray,
 )
 from qgis.PyQt.QtWidgets import (
     QAbstractItemDelegate,
@@ -62,7 +68,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from collections import deque, defaultdict, namedtuple, OrderedDict
 import math
-import traceback
+import bisect
 from enum import Enum
 
 
@@ -73,12 +79,13 @@ class ProfileRoles(Enum):
 @dataclass
 class ProfileArranging:
     FIG_HEIGHT: int = 150
-    FIG_WIDTH: int = 350
+    FIG_WIDTH: int = 475
+    dataRowsCount: int = 130
     V_LINES_GRID: int = 3
     H_LINES_GRID: int = 5
     X_AXIS_NAME: str = "km"
     Y_AXIS_NAME: str = "m"
-    NAME_WIDTH: int = 25
+    METERS_RATIO: int = 1000
     STIPPLE: int = 3
     Y_LABEL_LEFT_INDENT: int = 0
     Y_LABEL_RIGHT_INDENT: int = 1
@@ -90,7 +97,7 @@ class ProfileArranging:
     X_LABEL_WIDTH: int = 40
     Y_LABEL_WIDTH: int = 50
     Y_TIP_FORMAT: str = "{: 7.2f}"
-    X_TIP_FORMAT: str = "{:^6.3f}"
+    X_TIP_FORMAT: str = "{: 6.3f}"
     Y_DATA_FORMAT: str = "{: 7.2f} m"
     X_DATA_FORMAT: str = "{:^6.3f} km"
     G_DATA_FORMAT: str = "{: 2.2f} °"
@@ -121,7 +128,8 @@ class ProfileArranging:
     infoFont: QFont = field(init=False)
     infoHeight: int = field(init=False)
     sectNames: namedtuple = field(init=False)
-    tooltips: namedtuple = field(init=False)
+    browsedInfo: dict = field(init=False)
+
 
     def __post_init__(self):
         self.labelFont = QFont(self.FONT_FAMILY, self.LABEL_POINT_SIZE, weight=self.LABEL_WEIGHT)
@@ -146,6 +154,7 @@ class ProfileArranging:
         # data for horizontal lines
         deltaY = int(self.FIG_HEIGHT / (self.H_LINES_GRID + 1))
         self.hLines = [(y + 1) * deltaY for y in range(self.H_LINES_GRID - 1)]
+        print(f'ProfileArranging hLines = {self.hLines}')
         # Setting stipples for horizontal grig lines
         count = int(self.FIG_WIDTH / self.STIPPLE)
         self.hStipples = [
@@ -163,6 +172,8 @@ class ProfileArranging:
             'maxElevation',
             'minGradient',
             'maxGradient',
+            'xTooltip',
+            'yTooltip'
         ]
         titles = [
             'Proj Distance',
@@ -174,45 +185,49 @@ class ProfileArranging:
             'Min Elevation',
             'Max Elevation',
             'Min Gradient',
-            'Max Gradient'
+            'Max Gradient',
+            '',
+            '',
         ]
         self.sectNames = namedtuple("SECTIONS", names)(*list(range(len(names))))
         self.sectTitles = {i: v for i, v in enumerate(titles)}
-        """
-        self.groupSections = {
-            'CURRENT': [
-                self.sectNames.curElevation,
-                self.sectNames.curGradient,
-                self.sectNames.curFoot,
-                self.sectNames.curLog
-            ],
-            'TOTAL': [
-                self.sectNames.maxElevation,
-                self.sectNames.minElevation,
-                self.sectNames.maxGradient,
-                self.sectNames.minGradient,
-                self.sectNames.totFoot,
-                self.sectNames.totLog
-            ]
-        }
-        """
+        names = self.sectNames
+        # Setting up the output order in layout
+        fields = [
+            names.curElevation,
+            names.curGradient,
+            names.curFoot,
+            names.curLog,
+            names.xTooltip,
+            names.yTooltip,
+        ]
+        totals = [
+            names.maxElevation,
+            names.minElevation,
+            names.maxGradient,
+            names.minGradient,
+            names.totFoot,
+            names.totLog,
+        ]
+        self.browsedInfo = {it: idx for idx, it in enumerate(fields)}
+        self.totalInfo = {it: idx for idx, it in enumerate(totals)}
 
     def getFormattedData(self, data, section):
+        names = self.sectNames
         try:
             return {
-                section == self.sectNames.curFoot: f"{self._profileArranging.X_DATA_FORMAT}".format(data),
-                section == self.sectNames.totFoot: f"{self._profileArranging.X_DATA_FORMAT}".format(data),
-                section == self.sectNames.curElevation: f"{self._profileArranging.Y_TIP_FORMAT}".format(data),
-                section == self.sectNames.curGradient: f"{self._profileArranging.G_DATA_FORMAT}".format(data),
-                section == self.sectNames.curLog: f"{self._profileArranging.X_DATA_FORMAT}".format(data),
-                section == self.sectNames.totLog: f"{self._profileArranging.X_DATA_FORMAT}".format(data),
-                section == self.sectNames.minElevation: f"{self._profileArranging.Y_TIP_FORMAT}".format(data),
-                section == self.sectNames.maxElevation: f"{self._profileArranging.Y_TIP_FORMAT}".format(data),
-                section == self.sectNames.minGradient: f"{self._profileArranging.G_DATA_FORMAT}".format(data),
-                section == self.sectNames.maxGradient: f"{self._profileArranging.G_DATA_FORMAT}".format(data),
-                section == len(self.sectNames): f"{self._profileArranging.X_TIP_FORMAT}".format(data),  # xTooltip
-                section == len(self.sectNames) + 1: f"{self._profileArranging.Y_TIP_FORMAT}".format(data),  # yTooltip
-                section not in range(len(self.sectNames) + 2): ''
+                section == names.curFoot: self.X_DATA_FORMAT.format(data),
+                section == names.totFoot: self.X_DATA_FORMAT.format(data),
+                section == names.curElevation: self.Y_TIP_FORMAT.format(data),
+                section == names.curGradient: self.G_DATA_FORMAT.format(data),
+                section == names.curLog: self.X_DATA_FORMAT.format(data),
+                section == names.totLog: self.X_DATA_FORMAT.format(data),
+                section == names.minElevation: self.Y_TIP_FORMAT.format(data),
+                section == names.maxElevation: self.Y_TIP_FORMAT.format(data),
+                section == names.minGradient: self.G_DATA_FORMAT.format(data),
+                section == names.maxGradient: self.G_DATA_FORMAT.format(data),
+                section == names.xTooltip: self.X_TIP_FORMAT.format(data),
+                section == names.yTooltip: self.Y_TIP_FORMAT.format(data),
             }[True]
         except:
             return ''
@@ -233,197 +248,291 @@ class ProfileArranging:
 
 @dataclass
 class ProfileData:
-    lineString: QgsLineString
+    geometry: QgsGeometry
     profileArranging: ProfileArranging
-    dataRowsCount: int
     minRowsLimit: int = 10
     minColumnsLimit: int = 10
     minDistance = 0.001
-    maxElevation: float = - float('inf')
-    minElevation: float = float('inf')
     subseaRow: float = float('inf')
+    totalData: dict = field(default_factory=lambda: {})
     model: QStandardItemModel = field(init=False)
     rows: list = field(init=False)
+    xAxisData: list = field(init=False)
+    yAxisData: list = field(init=False)
     dataImage: QImage = field(init=False)
+    rowsCount: int = field(init=False)
+    lineString: QgsLineString = field(init=False)
+    log: float = field(init=False)
+    maxTotalDataWidth: int = field(init=False)
+    maxCurrentDataWidth: int = field(init=False)
+    maxXTooltipDataWidth: int = field(init=False)
+    maxYTooltipDataWidth: int = field(init=False)
+    maxXAxisDataWidth: int = field(init=False)
+    maxYAxisDataWidth: int = field(init=False)
 
     def __post_init__(self):
         if (
-                isinstance(self.lineString, QgsLineString) and
-                self.lineString.isValid() and
-                self.lineString.numPoints() > 1 and
+                isinstance(self.geometry, QgsGeometry) and
+                self.geometry.isGeosValid() and
                 self.profileArranging is not None and
                 self.profileArranging.FIG_HEIGHT >= self.minRowsLimit and
                 self.profileArranging.FIG_WIDTH - 2 >= self.minColumnsLimit and
-                self.dataRowsCount <= self.profileArranging.FIG_HEIGHT
+                self.profileArranging.METERS_RATIO > 0
         ):
-            # Adding gradient values for each vertex
-            self.lineString.dropMValue() #  Clear possible M-values
-            dX = self.lineString.length() / (self.profileArranging.FIG_WIDTH - 2)
+            """
+                new_point = QgsPoint(point.x(), point.y(), m=accumulated_distance)
+            # Создаём линию
+            line_string = QgsLineString(new_points)
+            """
+            # Creation a copy of geometry to remove duplicate nodes
+            self.lineString = self.geometry.get()
+            self.lineString.removeDuplicateNodes()
+            # Calculating geometry length in Ellipsoidal coordinate system
+            distance = QgsDistanceArea()
+            distance.setEllipsoid("WGS84")
+            # The distance of the profile route
+            totalLength = distance.measureLength(self.geometry)  # In meters!!!
+            if totalLength == 0.0:
+                self.model = None
+                self.dataImage = None
+                self.lineString = None
+                self.rows = []
+                self.yAxisData = []
+                return
+            # The interval per a column (The first and the last columns are without data)
+            dX = totalLength / (self.profileArranging.FIG_WIDTH - 2)
+            log = 0.0
             segment = 0.0
             modulation = []
             # The structure of modulation is a list of tuples:
             #   - the index is a serial number of points
             #   - a number of a column from data view,
             #   - the remainder of division for log accounting
+            maxElevation = - float('inf')
+            minElevation = float('inf')
+            minGradient = float('inf')
+            maxGradient = - float('inf')
+            # Forming a list of spacing between the point with index and the point with index-1
+            pointSlants = [0.0]
+            # Adding data of the first point
             gradient = 0.0
-            for i in range(self.lineString.numPoints() - 1):
-                div = segment / dX
-                clmn = int(div)
-                modulation.append((clmn, div - clmn))
-                segment += self.lineString.segmentLength(i)
-                if self.minElevation >= self.lineString.zAt(i):
-                    self.minElevation = self.lineString.zAt(i)
-                if self.maxElevation <= self.lineString.zAt(i):
-                    self.maxElevation = self.lineString.zAt(i)
-                gradient = math.degrees(
-                    math.atan((self.lineString.zAt(i) - self.lineString.zAt(i + 1)
-                        ) / self.lineString.pointN(i).distance(self.lineString.pointN(i + 1)))
+            gradients = [gradient]  # Setting gradient of 0-point in degrees!!!
+            # There is an offset of the 0-column due to y-axis, the 1-column consists the first point
+            modulation.append((1, 0.0))     # 0-point is in the 1-column
+            for i in range(1, self.lineString.numPoints()):
+                dist = distance.measureLine(
+                    QgsPointXY(self.lineString.pointN(i - 1)),
+                    QgsPointXY(self.lineString.pointN(i))
                 )
-                self.lineString.addMValue(gradient)
-            # Last vertex point
-            self.lineString.addMValue(gradient) #   Setting the previous gradient
-            modulation.append((
-                self.profileArranging.FIG_WIDTH - 3,
-                segment / dX - int(segment / dX)
-            ))
-            # modDict - a dictionary of points numerical order:
-            #   key - is a number of a column from data view
-            #   value - is a list of data view column numbers
-            modDict = defaultdict(list)
-            for j, pnt in enumerate(modulation):
-                modDict[pnt[0]].append(j)
-            # Elevation modulating parameters
-            dY = (self.maxElevation - self.minElevation) / (self.dataRowsCount - 1)
-            if self.minElevation <= 0.0:
-                self.subseaRow = self.profileArranging.FIG_HEIGHT - \
-                                 int((self.profileArranging.FIG_HEIGHT - self.dataRowsCount) / 2) \
-                                 - 1 + int(self.minElevation / dY)
-            bOffset = int((self.profileArranging.FIG_HEIGHT + self.dataRowsCount) / 2)
-            # Creating the first item of screed
-            elvs = [self.lineString.zAt(e) for e in modDict[0]]
-            elevation1 = min(elvs)
-            row1 = bOffset - int((elevation1 - self.minElevation) / dY + 0.5)
-            elevation2 = max(elvs)
-            row2 = bOffset - int((elevation2 - self.minElevation) / dY + 0.5)
-            gradient = self.lineString.mAt(modDict[0][-1])
-            screed = namedtuple('SCREED', 'row1 row2')(
-                [row1],
-                [row2]
-            )
-            styling = self.profileArranging.getFormattedData
-            names = self.profileArranging.sectNames
-            eStr = styling(elevation1, names.curElevation)
-            if elevation1 != elevation2:
-                eStr += '-' + styling(elevation2, names.curElevation)
-            # Creating a model for widgets with info details
-            self.model = QStandardItemModel(
-                # The number of rows for details widgets
-                self.profileArranging.FIG_WIDTH,
-                # The number of columns for all widgets
-                len(names._fields) + 2
-            )
-            # The first and the last columns in the table view are axes. All widgets are empty
-            for i in (0, self.profileArranging.FIG_WIDTH - 1):
-                self.model.setItem(i, names.curElevation, QStandardItem(''))
-                self.model.setItem(i, names.curGradient, QStandardItem(''))
-                self.model.setItem(i, names.curFoot, QStandardItem(''))
-                self.model.setItem(i, names.curLog, QStandardItem(''))
-                self.model.setItem(i, len(names), QStandardItem(''))    # xTooltip
-                self.model.setItem(i, len(names) + 1, QStandardItem(''))    # yTooltip
-            # The second column in the table view is the first point
-            self.model.setItem(1, names.curElevation, QStandardItem(eStr))
-            self.model.setItem(1, names.curGradient, QStandardItem(styling(gradient, names.curGradient)))
-            self.model.setItem(1, names.curFoot, QStandardItem(styling(0.0, names.curFoot)))
-            self.model.setItem(1, names.curLog, QStandardItem(styling(0.0, names.curLog)))
-            self.model.setItem(1, len(names), QStandardItem(styling(0.0, len(names))))  # xTooltip
-            self.model.setItem(1, len(names) + 1, QStandardItem(styling(elevation2, len(names) + 1)))  # yTooltip
-            log = 0.0
-            ft = 0.0
-            for i0 in modDict[0][1:]:
-                segment = self.lineString.segmentLength(i0 - 1)
-                ft += segment
-                cs = math.cos(math.radians(self.lineString.mAt(i0 - 1)))
-                if cs:
-                    log += segment / cs
-            dElv = (dX - ft) * math.tan(math.radians(gradient))
-            elv0 = self.lineString.zAt(modDict[0][-1]) + dElv
-            cs = math.cos(math.radians(gradient))
-            if cs:
-                log += (dX - ft) / cs
-            foot = dX   # The second column has foot = 2*dX
-            minGradient = maxGradient = gradient
-            for i in range(1, self.profileArranging.FIG_WIDTH - 2):
-                foot += dX
-                # There are three variants for i-column:
-                #   1 - no points (i is not a key of modDict),
-                #   2 - points have place.
-                #   The first and the last columns should not be empty.
-                if i not in modDict:
-                    elevation1 = elv0 + dX * math.tan(math.radians(gradient))
-                    cs = math.cos(math.radians(gradient))
-                    if cs:
-                        log += dX / cs
-                    row1 = bOffset - int((elevation1 - self.minElevation) / dY + 0.5)
-                    elevation2 = elevation1
-                    row2 = row1
-                    elv0 = elevation1
-                else:
-                    segment = dX * modulation[modDict[i][0]][1]
-                    cs = math.cos(math.radians(gradient))
-                    if cs:
-                        log += segment / cs
-                    gradient = self.lineString.mAt(modDict[i][-1])
-                    segment = dX - dX * modulation[modDict[i][-1]][1]
-                    cs = math.cos(math.radians(gradient))
-                    if cs:
-                        log += segment / cs
-                    dElv = segment * math.tan(math.radians(gradient))
-                    elv0 = self.lineString.zAt(modDict[i][-1]) + dElv
-                    elvs = [self.lineString.zAt(e) for e in modDict[i]]
-                    elvs.append(elv0)
-                    elevation1 = min(elvs)
-                    row1 = bOffset - int((elevation1 - self.minElevation) / dY + 0.5)
-                    elevation2 = max(elvs)
-                    row2 = bOffset - int((elevation2 - self.minElevation) / dY + 0.5)
-                    for j in modDict[i][1:]:
-                        segment = self.lineString.segmentLength(j - 1)
-                        cs = math.cos(math.radians(self.lineString.mAt(j - 1)))
-                        if cs:
-                            log += segment / cs
-                eStr = styling(elevation1, names.curElevation)
-                if elevation1 != elevation2:
-                    eStr += '-' + styling(elevation2, names.curElevation)
-                self.model.setItem(i + 1, names.curElevation, QStandardItem(eStr))
-                self.model.setItem(i + 1, names.curGradient, QStandardItem(styling(gradient, names.curGradient)))
-                self.model.setItem(i + 1, names.curFoot, QStandardItem(styling(foot, names.curFoot)))
-                self.model.setItem(i + 1, names.curLog, QStandardItem(styling(log, names.curLog)))
-                self.model.setItem(i + 1, len(names), QStandardItem(styling(0.0, len(names))))  # xTooltip
-                self.model.setItem(i + 1, len(names) + 1, QStandardItem(styling(elevation2, len(names) + 1)))  # yTooltip
-                screed.row1.append(row1)
-                screed.row2.append(row2)
+                segment += dist
+                div = segment / dX + 1
+                # Getting a column with a point with left offset
+                clmn = int(div) + 1
+                # Adding a point column and an excess
+                modulation.append((clmn, div - clmn))
+                dEval = self.lineString.zAt(i) - self.lineString.zAt(i - 1)  # In meters!!!
+                # Calculating a log of the profile route
+                slant = math.sqrt(dist * dist + dEval * dEval)  # In meters!!!
+                pointSlants.append(slant)
+                log += slant  # In meters!!!
+                if minElevation >= self.lineString.zAt(i):
+                    minElevation = self.lineString.zAt(i)  # In meters!!!
+                if maxElevation <= self.lineString.zAt(i):
+                    maxElevation = self.lineString.zAt(i)  # In meters!!!
+                # Calculating a gradient between two points in degrees
+                gradient = math.degrees(math.atan(dEval / dist))
+                # Adding gradient values for each vertex
+                gradients.append(gradient)    # In degrees!!!
+                # Getting max and min gradients of the route
                 if gradient > maxGradient:
                     maxGradient = gradient
                 if gradient < minGradient:
                     minGradient = gradient
-            # Common data for info widgets
+            totalLog = log / self.profileArranging.METERS_RATIO
+            deltaElevation = maxElevation - minElevation
+            dataRows = int(deltaElevation / dX)
+            if deltaElevation > 0.0 and dataRows > 1:
+                self.rowsCount = self.profileArranging.dataRowsCount
+                if self.rowsCount > dataRows:
+                    self.rowsCount = dataRows
+            else:
+                self.rowsCount = 1
+            print(f'ProfileData: minE = {minElevation}, maxE = {maxElevation}, dX = {dX}')
+            print(f'  Rows values limit = {self.rowsCount}')
+            # modDict - a dictionary of columns with a list of point numbers:
+            modDict = defaultdict(list)
+            for j, pnt in enumerate(modulation):
+                # j is a point number, key=pnt[0] is a column number
+                modDict[pnt[0]].append(j)
+            # The sorted list of columns needs to find the nearest right column with a point
+            #   if there is no points in a target column
+            sortedKeys = sorted(modDict.keys())
+            # Elevation modulating parameters
+
+            # !!! if self.rowsCount == 1 !!!
+            dY = deltaElevation / (self.rowsCount - 1)
+            if minElevation <= 0.0:
+                self.subseaRow = self.profileArranging.FIG_HEIGHT - \
+                                 int((self.profileArranging.FIG_HEIGHT - self.rowsCount) / 2) \
+                                 - 1 + int(minElevation / dY)
+            bOffset = int((self.profileArranging.FIG_HEIGHT + self.rowsCount) / 2)
+            names = self.profileArranging.sectNames
+            styling = self.profileArranging.getFormattedData
+            # Calculating y-axis values
+            self.yAxisData = []
+            for row in self.profileArranging.hLines:
+                self.yAxisData.append(styling(minElevation + (bOffset - row) * dY, names.yTooltip))
+            # Calculating x-axis values
+            print(f'   vLines = {self.profileArranging.vLines}')
+            self.xAxisData = []
+            for column in self.profileArranging.vLines[:-1]:
+                self.xAxisData.append(styling(column * dX / self.profileArranging.METERS_RATIO, names.xTooltip))
+            self.xAxisData.append(styling(totalLength / self.profileArranging.METERS_RATIO, names.xTooltip))
+            browsed = self.profileArranging.browsedInfo
+            # Creating a model for widgets with info details
+            self.model = QStandardItemModel(
+                # The number of rows for details widgets
+                self.profileArranging.FIG_WIDTH,
+                # The number of widgets with browsed information
+                len(browsed)
+            )
+            # Filling the model with empty values
+            foot = 0.0
+            curFootLen = 0
+            xToolTipLen = 0
+            maxCur = ''
+            maxXTooltip = ''
             for i in range(self.profileArranging.FIG_WIDTH):
-                self.model.setItem(i, names.totFoot, QStandardItem(
-                    styling(self.lineString.length(), names.totFoot)))
-                self.model.setItem(i, names.totLog, QStandardItem(log, names.totLog))
-                self.model.setItem(i, names.minElevation, QStandardItem(self.minElevation, names.minElevation))
-                self.model.setItem(i, names.maxElevation, QStandardItem(self.maxElevation, names.maxElevation))
-                self.model.setItem(i, names.minGradient, QStandardItem(minGradient, names.minGradient))
-                self.model.setItem(i, names.maxGradient, QStandardItem(maxGradient, names.maxGradient))
+                self.model.setItem(i, browsed[names.curElevation], QStandardItem(''))
+                self.model.setItem(i, browsed[names.curGradient], QStandardItem(''))
+                if i in (0, self.profileArranging.FIG_WIDTH - 1):
+                    self.model.setItem(i, browsed[names.xTooltip], QStandardItem(''))
+                    self.model.setItem(i, browsed[names.curFoot], QStandardItem(''))
+                else:
+                    curFoot = styling(foot, names.curFoot)
+                    if len(curFoot) > curFootLen:
+                        curFootLen = len(curFoot)
+                        maxCur = curFoot
+                    xTooltip = styling(foot, names.xTooltip)
+                    if len(xTooltip) > xToolTipLen:
+                        xToolTipLen = len(xTooltip)
+                        maxXTooltip = xTooltip
+                    self.model.setItem(i, browsed[names.xTooltip], QStandardItem(xTooltip))
+                    self.model.setItem(i, browsed[names.curFoot], QStandardItem(curFoot))
+                self.model.setItem(i, browsed[names.curLog], QStandardItem(''))
+                self.model.setItem(i, browsed[names.yTooltip], QStandardItem(''))
+                foot += dX / self.profileArranging.METERS_RATIO
+            fontMetrics = QFontMetrics(self.profileArranging.infoFont)
+            rows = {row: None for row in range(self.profileArranging.FIG_WIDTH)}
+            log = 0.0
+            maxYTooltip = ''
+            # Populating the model and y-values(rows)
+            for i in range(1, self.profileArranging.FIG_WIDTH - 1):
+                # Cases for i-column:
+                #   1 - no points (i is not a key of modDict), but the first point in the 0 column,
+                #   2 - points have place.
+                if i not in modDict:  # No points in the i-column
+                    # idx = bisect.bisect_left(sortedKeys, i) - 1   # Should be >= 0
+                    # leftColumn = sortedKeys[idx]
+                    idx = bisect.bisect_right(sortedKeys, i)
+                    if idx < len(sortedKeys):
+                        rightColumn = sortedKeys[idx]
+                        rightPoint = modDict[rightColumn][0]
+                        gradient = gradients[rightPoint]
+                        elevation1 = elevation2 = (dX * (rightColumn - i) *
+                                                   math.tan(math.radians(gradient)) + self.lineString.zAt(rightPoint)
+                                                   )
+                        row1 = row2 = bOffset - int((elevation1 - minElevation) / dY + 0.5)
+                        cs = math.cos(math.radians(gradient))
+                        if cs == 0.0:
+                            cs = 1
+                        log += dX / cs / self.profileArranging.METERS_RATIO
+                        gradient1 = gradient2 = gradient
+                    else:  # There is no curve on the right columns
+                        break
+                else:   # Calculating a log of points in the i-column
+                    # 1) Calculating the log from the left column to the first point
+                    gradient = gradients[modDict[i][0]]
+                    cs = math.cos(math.radians(gradient))
+                    if cs == 0.0:
+                        cs = 1
+                    deltaX = modulation[modDict[i][0]][1] * dX
+                    logLeft = deltaX / abs(cs)
+                    # 2) Calculating the logs between points in the column
+                    logPoints = 0.0
+                    gradient1 = gradient2 = gradient
+                    for j in modDict[i][1:]:
+                        logPoints += pointSlants[j]
+                        if gradients[j] < gradient1:
+                            gradient1 = gradients[j]
+                        if gradients[j] > gradient2:
+                            gradient2 = gradients[j]
+                    # 3) Calculating the log from the last point to the right column
+                    logRight = 0.0
+                    if modDict[i][-1] + 1 < self.lineString.numPoints():
+                        cs = math.cos(math.radians(gradients[modDict[i][-1] + 1]))
+                        if cs == 0.0:
+                            cs = 1
+                        deltaX = dX - modulation[modDict[i][-1]][1] * dX
+                        if deltaX < 0:
+                            deltaX = 0.0
+                        logRight = deltaX / abs(cs)
+                    else:  # The last point in the column is the last point of the curve
+                        pass
+                    # Total log of the curve in the column
+                    log += (logLeft + logPoints + logRight) / self.profileArranging.METERS_RATIO
+                    # Calculating min and max values of evaluation in the column
+                    elvL = [self.lineString.zAt(e) for e in modDict[i]]
+                    elevation1 = min(elvL)
+                    row1 = bOffset - int((elevation1 - minElevation) / dY + 0.5)
+                    elevation2 = max(elvL)
+                    row2 = bOffset - int((elevation2 - minElevation) / dY + 0.5)
+                eStr = styling(elevation1, names.curElevation)
+                if elevation1 != elevation2:
+                    eStr += ' - ' + styling(elevation2, names.curElevation)
+                gStr = styling(gradient1, names.curGradient)
+                if gradient1 != gradient2:
+                    gStr += ' - ' + styling(gradient2, names.curGradient)
+                curLog = styling(log, names.curLog)
+                yTooltip = styling(elevation2, names.yTooltip)
+                maxStr = max([eStr, gStr, curLog], key=len)
+                if len(maxCur) < len(maxStr):
+                    maxCur = maxStr
+                if len(maxYTooltip) < len(yTooltip):
+                    maxYTooltip = yTooltip
+                self.model.setItem(i, browsed[names.curElevation], QStandardItem(eStr))
+                self.model.setItem(i, browsed[names.curGradient], QStandardItem(gStr))
+                self.model.setItem(i, browsed[names.curLog], QStandardItem(curLog))
+                self.model.setItem(i, browsed[names.yTooltip],
+                                   QStandardItem(yTooltip))  # yTooltip
+                rows[i] = (row1, row2)
+                # print(f'ProfileData: rows[{i}] = ({row1}, {row2})')
+            # Common data for info widgets
+            totalLength = totalLength / self.profileArranging.METERS_RATIO
+            print(f'ProfileData: totalLog = {totalLog}, log = {log}')
+            self.totalData = {names.maxElevation: styling(maxElevation, names.maxElevation),
+                              names.minElevation: styling(minElevation, names.minElevation),
+                              names.maxGradient: styling(maxGradient, names.maxGradient),
+                              names.minGradient: styling(minGradient, names.minGradient),
+                              names.totFoot: styling(totalLength, names.totFoot),
+                              names.totLog: styling(totalLog, names.totLog)}
+            # Setting up width values for layouts width fixing
+            self.maxTotalDataWidth = fontMetrics.horizontalAdvance(max(list(self.totalData.values()), key=len))
+            self.maxYTooltipDataWidth = fontMetrics.horizontalAdvance(maxYTooltip)
+            self.maxXTooltipDataWidth = fontMetrics.horizontalAdvance(maxXTooltip)
+            self.maxCurrentDataWidth = fontMetrics.horizontalAdvance(maxCur)
+            self.maxYAxisDataWidth = fontMetrics.horizontalAdvance(max(list(self.yAxisData), key=len))
+            self.maxXAxisDataWidth = fontMetrics.horizontalAdvance(max(list(self.xAxisData), key=len))
             # Creating data for table view model
             pixelDataRGB = []
             alpha = 255
+
             self.rows = []
             for row in range(self.profileArranging.FIG_HEIGHT):
                 for column in range(self.profileArranging.FIG_WIDTH):
-                    idx = column - 1
-                    if idx in range(len(screed.row1)):
-                        minRow = min(screed.row1[idx], screed.row2[idx])
-                        maxRow = max(screed.row1[idx], screed.row2[idx])
+                    if rows[column] is not None:
+                        minRow = min(rows[column])
+                        maxRow = max(rows[column])
                         self.rows.append(maxRow)
                         # Placed on a curve
                         if minRow <= row <= maxRow:
@@ -484,13 +593,16 @@ class ProfileData:
         else:
             self.model = None
             self.dataImage = None
+            self.rows = []
+            self.yAxisData = []
+            self.rowsCount = 0
 
 
 class ProfileModel(QAbstractTableModel):
     def __init__(self, profileArranging, parent=None):
-        super().__init__(parent)
         self._rowCount = 0
         self._columnCount = 0
+        super().__init__(parent)
         self._profileData = None
         self._rowHover = -1
         self._colHover = -1
@@ -520,7 +632,7 @@ class ProfileModel(QAbstractTableModel):
                 return -1
         """
         try:
-            return self.profileData.rows[column]
+            return self._profileData.rows[column]
         except:
             return -1
 
@@ -605,14 +717,14 @@ class ProfileModel(QAbstractTableModel):
         self._columnCount = newProfileData.dataImage.width()
         self.endResetModel()
 
-    def rowCount(self):
+    def rowCount(self, parent=QModelIndex()):
         return self._rowCount
 
-    def columnCount(self):
+    def columnCount(self, parent=QModelIndex()):
         return self._columnCount
 
     def data(self, index, role=Qt.DisplayRole):
-        if role in (Qt.DisplayRole, Qt.UserRole) and self._profileData:
+        if role in (Qt.DisplayRole, Qt.UserRole) and self._profileData and self._rowCount and self._columnCount:
             try:
                 if not index.isValid():
                     return QVariant()
@@ -641,11 +753,13 @@ class ProfileModel(QAbstractTableModel):
                 return self._profileData.dataImage.pixelColor(index.column(), index.row())
             except:
                 return self._profileArranging.bgColor
+        else:
+            return None
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if (role == Qt.SizeHintRole):
+        if role == Qt.SizeHintRole and self._rowCount and self._columnCount:
             return QSize(1, 1)
-        return QVariant()
+        return None
 
 
 class ProfileDelegate(QAbstractItemDelegate):
@@ -674,6 +788,7 @@ class ProfileTable(QTableView):
     setTooltipData = pyqtSignal(object)
     showTooltips = pyqtSignal()
     hideTooltips = pyqtSignal()
+
     # activateScaleBtn = pyqtSignal(bool)
     # showObject = pyqtSignal()
     # paintingFinished = pyqtSignal()
@@ -828,7 +943,7 @@ class ProfileFrame(QFrame):
         self.yTooltipPositions = None
         self.profileArranging = ProfileArranging()
         self.setFrameStyle(QFrame.Panel | QFrame.Sunken)
-        self.profileFrame.setStyleSheet(f"background-color: {self.profileArranging.bgColor.name()};")
+        self.setStyleSheet(f"background-color: {self.profileArranging.bgColor.name()};")
         self.placeholder = QLabel(self)
         self.profileView = ProfileTable(self.profileArranging, parent=self)
         # Creating the stacked widget for placeholder and profileView
@@ -843,24 +958,25 @@ class ProfileFrame(QFrame):
         self.stackedWidget.destroyed.connect(self.stackedWidgetDestroyed)
         # Creating axis labels
         self.xLabels = []
-        for col in self.profileArranging.vLines:
-            label = QLabel(parent=self)
-            label.setAutoFillBackground(True)
-            label.setPalette(self.profileArranging.unHoverPalette)
-            label.setFont(self.profileArranging.labelFont)
-            label.setText('')
-            label.setFixedWidth(self.profileArranging.Y_LABEL_WIDTH)
-            label.setFixedHeight(self.profileArranging.labelHeight)
-            label.setAlignment(Qt.AlignCenter | Qt.AlignHCenter)
-            self.xLabels.append(label)
-        self.yLabels = []
-        for row in self.profileArranging.hLines:
+        for col in self.profileArranging.vLines[1:]:
             label = QLabel(parent=self)
             label.setAutoFillBackground(True)
             label.setPalette(self.profileArranging.unHoverPalette)
             label.setFont(self.profileArranging.labelFont)
             label.setText('')
             label.setFixedWidth(self.profileArranging.X_LABEL_WIDTH)
+            label.setFixedHeight(self.profileArranging.labelHeight)
+            label.setAlignment(Qt.AlignCenter | Qt.AlignHCenter)
+            self.xLabels.append(label)
+        self.yLabels = []
+        print(f'init ProfileFrame: hLines = {self.profileArranging.hLines}')
+        for row in self.profileArranging.hLines:
+            label = QLabel(parent=self)
+            label.setAutoFillBackground(True)
+            label.setPalette(self.profileArranging.unHoverPalette)
+            label.setFont(self.profileArranging.labelFont)
+            label.setText('')
+            label.setFixedWidth(self.profileArranging.Y_LABEL_WIDTH)
             label.setFixedHeight(self.profileArranging.labelHeight)
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.yLabels.append(label)
@@ -881,9 +997,8 @@ class ProfileFrame(QFrame):
             self.axisNames[axis] = label
         # Creating details labels and its mapping
         self.mapper = QDataWidgetMapper()
-        self.mappedWidgetCount = 0
         self.detailsLabels = {}
-        for name in list(self.profileArranging.sectNames):
+        for name in self.profileArranging.browsedInfo:
             label = QLabel(parent=self)
             label.setAutoFillBackground(True)
             label.setPalette(self.profileArranging.unHoverPalette)
@@ -892,42 +1007,99 @@ class ProfileFrame(QFrame):
             label.setFixedHeight(self.profileArranging.infoHeight)
             label.setAlignment(Qt.AlignRight)
             self.detailsLabels[name] = label
-            self.mapper.addMapping(label, name)
-            self.mappedWidgetCount += 1
-        # Creating tooltip labels and its mapping
-        self.tooltips = {}
-        for idx, name, l in enumerate([
-            ('x', self.profileArranging.X_LABEL_WIDTH),
-            ('y', self.profileArranging.Y_LABEL_WIDTH),
+        # Arranging tooltip labels
+        names = self.profileArranging.sectNames
+        for idx, it in enumerate([
+            (names.xTooltip, self.profileArranging.X_LABEL_WIDTH),
+            (names.yTooltip, self.profileArranging.Y_LABEL_WIDTH),
         ]):
-            tooltipLabel = QLabel()
+            name, l = it
+            tooltipLabel = self.detailsLabels[name]
+            tooltipLabel.setAttribute(Qt.WA_DeleteOnClose)
             tooltipLabel.setPalette(self.profileArranging.unHoverPalette)
             tooltipLabel.setFont(self.profileArranging.labelFont)
             tooltipLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             tooltipLabel.setFixedHeight(self.profileArranging.labelHeight)
             tooltipLabel.setFixedWidth(l)
-            # tooltipLabel.setObjectName("Tooltip")
+            tooltipLabel.setObjectName("Tooltip")
             tooltipLabel.setStyleSheet(
                 "#Tooltip { border: 1px solid red; }"
             )
             tooltipLabel.setWindowFlags(Qt.Popup | Qt.ToolTip)
             tooltipLabel.hide()
-            self.tooltips[name] = tooltipLabel
-            self.mapper.addMapping(tooltipLabel, len(self.profileArranging.sectNames) + idx)
-            self.mappedWidgetCount += 1
+        totalInfo = self.profileArranging.totalInfo
+        self.totalLabels = {}
+        for name in totalInfo:
+            label = QLabel(parent=self)
+            label.setAutoFillBackground(True)
+            label.setPalette(self.profileArranging.unHoverPalette)
+            label.setFont(self.profileArranging.infoFont)
+            label.setText('')
+            label.setFixedHeight(self.profileArranging.infoHeight)
+            label.setAlignment(Qt.AlignRight)
+            self.totalLabels[name] = label
         # Composing widgets in the frame
         profileLayout = self.layoutWidgets()
         self.setLayout(profileLayout)
         # Connecting mouse events on table view with data updaters
-        self.view.isHover.connect(self.changeLabelsColor)   # For color changing of xLabels and yLabels
-        self.view.setTooltipData.connect(self.updateCurrents)
-        self.view.showTooltips.connect(self.showTooltips)
-        self.view.hideTooltips.connect(self.hideTooltips)
+        self.profileView.isHover.connect(self.changeLabelsColor)  # For color changing of xLabels and yLabels
+        self.profileView.setTooltipData.connect(self.updateCurrents)
+        self.profileView.showTooltips.connect(self.showTooltips)
+        self.profileView.hideTooltips.connect(self.hideTooltips)
+
+    def setMapModel(self, profile):
+        # As after setting new model in mapper: QDataWidgetMapper
+        #   it needs new widget mapping
+        self.mapper.setModel(profile.model)
+        names = self.profileArranging.sectNames
+        for name, it in self.detailsLabels.items():
+            it.setText('')
+            if name == names.xTooltip:
+                it.setFixedWidth(profile.maxXTooltipDataWidth)
+            elif name == names.yTooltip:
+                it.setFixedWidth(profile.maxYTooltipDataWidth)
+            else:
+                it.setFixedWidth(profile.maxCurrentDataWidth)
+            self.mapper.addMapping(it, self.profileArranging.browsedInfo[name], b"text")
+        self.mapper.toFirst()
 
     def setProfile(self, profile):
-        self.placeholder = QPixmap.fromImage(profile.dataImage)
-        self.mapper.setModel(profile.model)
-        self.view.model.changeProfileData(profile)
+        pm = QPixmap.fromImage(profile.dataImage)
+        self.placeholder.setPixmap(pm)
+        self.stackedWidget.setCurrentWidget(self.placeholder)
+        for idx, it in enumerate(self.yLabels):
+            it.setFixedWidth(profile.maxYAxisDataWidth)
+            it.setText(profile.yAxisData[idx])
+        for idx, it in enumerate(self.xLabels):
+            it.setFixedWidth(profile.maxXAxisDataWidth)
+            it.setText(profile.xAxisData[idx + 1])
+        self.setMapModel(profile)
+        for name, val in profile.totalData.items():
+            self.totalLabels[name].setText(val)
+            self.totalLabels[name].setFixedWidth(profile.maxTotalDataWidth)
+        self.profileView.model().changeProfileData(profile)
+
+    def updateCurrents(self, index):
+        # Inputting index has a row as y-value and a column as x-value from table view
+        # Getting current row to set curve position of the y-axis tooltip
+        row = self.profileView.model().getRow(index.column())
+        if row == -1:
+            self.hideTooltips()
+            return
+        # Updating current data
+        self.mapper.setCurrentIndex(index.column())
+        # Tooltip positions updating:
+        self.detailsLabels[self.profileArranging.sectNames.yTooltip].move(self.profileView.mapToGlobal(QPoint(
+            self.yLabelsLevel,
+            self.yTooltipPositions[row]
+        )))
+        self.detailsLabels[self.profileArranging.sectNames.xTooltip].move(self.profileView.mapToGlobal(QPoint(
+            self.xTooltipPositions[index.column()],
+            self.xLabelsLevel
+        )))
+        # names = self.profileArranging.sectNames
+        # idx = self.mapper.model().index(index.column(), len(self.profileArranging.sectNames._fields))
+        # print(f' foot = {self.mapper.model().data(idx, Qt.DisplayRole)}')
 
     def layoutWidgets(self):
         # Initializing layouts
@@ -936,6 +1108,7 @@ class ProfileFrame(QFrame):
         yLayout = QVBoxLayout()
         vLayout = QVBoxLayout()
         xLayout = QHBoxLayout()
+        hLayout = QHBoxLayout()
         # V-Layout widgets for y-axis values
         curV = - int(self.profileArranging.labelHeight / 2)
         for idx, it in enumerate(self.yLabels):
@@ -948,12 +1121,12 @@ class ProfileFrame(QFrame):
         yLayout.setSpacing(0)
         # H-Layout widgets for x-axis values
         xLayout.addWidget(self.axisNames['x'], 0, Qt.AlignLeft)
-        curV = self.profileArranging.NAME_WIDTH
-        deltaX = int(self.profileArranging.FIG_WIDTH / self.profileArranging.V_LINES_GRID)
-        for it in self.xLabels:
-            xLayout.addSpacing(deltaX - curV - int(self.profileArranging.X_LABEL_WIDTH / 2))
-            xLayout.addWidget(it, 0, Qt.AlignLeft)
-            curV = int(self.profileArranging.X_LABEL_WIDTH / 2)
+        dSpace1 = self.profileArranging.vLines[1] - int(self.profileArranging.X_LABEL_WIDTH * 5 / 3)
+        dSpace2 = self.profileArranging.vLines[1] - self.profileArranging.X_LABEL_WIDTH
+        spaces = [dSpace1] + [dSpace2 for _ in range(len(self.profileArranging.vLines) - 3)] + [dSpace1]
+        for idx, dSpace in enumerate(spaces):
+            xLayout.addSpacing(dSpace)
+            xLayout.addWidget(self.xLabels[idx], 0, Qt.AlignLeft)
         xLayout.addStretch()
         xLayout.setSpacing(0)
         # V-Layout stacked widget and x-axis values layout
@@ -965,7 +1138,7 @@ class ProfileFrame(QFrame):
         graphLayout.addSpacing(self.profileArranging.Y_LABEL_LEFT_INDENT)
         graphLayout.addLayout(yLayout)
         graphLayout.addSpacing(self.profileArranging.Y_LABEL_RIGHT_INDENT)
-        graphLayout.addLayout(graphLayout)
+        graphLayout.addLayout(vLayout)
         graphLayout.addStretch()
         graphLayout.setSpacing(0)
         # H-Layout details
@@ -974,31 +1147,27 @@ class ProfileFrame(QFrame):
         # Current details
         detailsCurrent = QGroupBox("CURRENT")
         formLayout = QFormLayout()
-        for name in [
-            names.curElevation,
-            names.curGradient,
-            names.curFoot,
-            names.curLog
-        ]:
-            formLayout.addRow(f'{self.profileArranging.sectTitles[name]} : ', self.detailsLabels[name])
+        names = self.profileArranging.sectNames
+        titles = self.profileArranging.sectTitles
+        sortedTuples = sorted(self.profileArranging.browsedInfo.items(), key=lambda x: x[1])
+        for it in sortedTuples:
+            if it[0] not in (names.xTooltip, names.yTooltip):
+                formLayout.addRow(f'{titles[it[0]]} : ', self.detailsLabels[it[0]])
         detailsCurrent.setLayout(formLayout)
-        # Total details
+        # Total info
         formLayout = QFormLayout()
         detailsTotal = QGroupBox("TOTAL")
-        for name in [
-            names.maxElevation,
-            names.minElevation,
-            names.maxGradient,
-            names.minGradient,
-            names.totFoot,
-            names.totLog
-        ]:
-            formLayout.addRow(f'{self.profileArranging.sectTitles[name]} : ', self.detailsLabels[name])
+        sortedTuples = sorted(self.profileArranging.totalInfo.items(), key=lambda x: x[1])
+        for it in sortedTuples:
+            formLayout.addRow(f'{titles[it[0]]} : ', self.totalLabels[it[0]])
         detailsTotal.setLayout(formLayout)
-        splitter.addWidget(detailsCurrent)
         splitter.addWidget(detailsTotal)
+        splitter.addWidget(detailsCurrent)
+        hLayout.addWidget(splitter, 0, Qt.AlignLeft)
+        hLayout.addStretch()
+        hLayout.setSpacing(0)
         profileLayout.addLayout(graphLayout)
-        profileLayout.addWidget(splitter)
+        profileLayout.addLayout(hLayout)
         profileLayout.addStretch()
         profileLayout.setSpacing(0)
         return profileLayout
@@ -1055,67 +1224,36 @@ class ProfileFrame(QFrame):
             for label in self.yLabels:
                 label.setPalette(self.profileArranging.unHoverPalette)
 
-    def updateCurrents(self, index):
-        row = self.view.model().getRow(index.column())
-        if row == -1:
-            self.hideTooltips()
-            return
-        # Updating current data
-        for sect in range(self.mappedWidgetCount):
-            self.mapper.mappedWidgetAt(sect).blockSignals(True)
-        self.mapper.setCurrentIndex(index.column())
-        for sect in range(self.mappedWidgetCount):
-            self.mapper.mappedWidgetAt(sect).blockSignals(False)
-        # Tooltip positions updating:
-        self.tooltips['y'].move(self.view.mapToGlobal(QPoint(
-            self.yLabelsLevel,
-            self.yTooltipPositions[row] + self.profile.BOTTOM_SPACE
-        )))
-        self.tooltips['x'].move(self.view.mapToGlobal(QPoint(
-            self.xTooltipPositions[index.column()],
-            self.xLabelsLevel
-        )))
-
     def showTooltips(self):
-        self.tooltips['x'].show()
-        self.tooltips['y'].show()
+        self.detailsLabels[self.profileArranging.sectNames.xTooltip].show()
+        self.detailsLabels[self.profileArranging.sectNames.yTooltip].show()
 
     def setPositionsData(self):
-        self.xLabelsLevel = self.view.geometry().bottomLeft().y() + 2
-        self.yLabelsLevel = self.view.geometry().topLeft().x() - self.tooltips['y'].geometry().width() - 1
+        xTooltip = self.detailsLabels[self.profileArranging.sectNames.xTooltip]
+        yTooltip = self.detailsLabels[self.profileArranging.sectNames.yTooltip]
+        self.xLabelsLevel = self.profileView.geometry().bottomLeft().y() + 2
+        self.yLabelsLevel = self.profileView.geometry().topLeft().x() - yTooltip.geometry().width() - 1
         self.yTooltipPositions = [
-            row + self.view.geometry().topLeft().y() - self.tooltips['y'].geometry().height()
-            for row in range(self.view.model().rowCount())
+            row + self.profileView.geometry().topLeft().y() - int(yTooltip.geometry().height() / 2)
+            for row in range(self.profileView.model().rowCount())
         ]
-        rightColumnLimit = self.view.model().columnCount() - \
-                           int(self.tooltips['x'].geometry().width() / 2)
-        rightLimit = self.view.geometry().topLeft().x() + self.view.model().columnCount() - \
-                     self.tooltips['x'].geometry().width()
+        rightColumnLimit = self.profileView.model().columnCount() - \
+                           int(xTooltip.geometry().width() / 2)
+        rightLimit = self.profileView.geometry().topLeft().x() + self.profileView.model().columnCount() - \
+                     xTooltip.geometry().width()
         self.xTooltipPositions = [
-            (column + self.view.geometry().topLeft().x() - \
-             int(self.tooltips['x'].geometry().width() / 2)
+            (column + self.profileView.geometry().topLeft().x() - \
+             int(xTooltip.geometry().width() / 2)
              ) if column < rightColumnLimit else rightLimit
-            for column in range(self.view.model().columnCount())
+            for column in range(self.profileView.model().columnCount())
         ]
 
     def hideTooltips(self):
-        # Clearing CURRENT widgets block
-        names = self.profileArranging.sectNames
-        for sect in [
-            names.curElevation,
-            names.curGradient,
-            names.curFoot,
-            names.curLog
-        ]:
-            self.mapper.mappedWidgetAt(sect).blockSignals(True)
-            self.mapper.mappedWidgetAt(sect).setText('')
-            self.mapper.mappedWidgetAt(sect).blockSignals(False)
+        self.mapper.toFirst()
         # Tooltips hiding
-        self.tooltips['x'].hide()
-        self.tooltips['y'].hide()
+        self.detailsLabels[self.profileArranging.sectNames.xTooltip].hide()
+        self.detailsLabels[self.profileArranging.sectNames.yTooltip].hide()
 
     def updateView(self):
-        pass
-        self.view.resizeColumnsToContents()
-        self.view.resizeRowsToContents()
-
+        self.profileView.resizeColumnsToContents()
+        self.profileView.resizeRowsToContents()

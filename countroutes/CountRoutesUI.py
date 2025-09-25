@@ -77,6 +77,8 @@ from qgis.PyQt.QtGui import (
 )
 from qgis.gui import QgsBrowserGuiModel, QgsBrowserWidget
 from collections import namedtuple
+import traceback
+
 
 def script_folder() -> str:
     """
@@ -263,13 +265,15 @@ class CrayonContainer(QWidget):
         # self.stackedWidget.setSizePolicy(QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed))
         # Making horizontal layout box with parts of profile widgets
         # Creating QFrame of profile page
-        profileFrame = profile_module.ProfileFrame()
+        self.profileFrame = profile_module.ProfileFrame()
+        self.profileArranging = self.profileFrame.profileArranging
+
         # Creating main layout
         """
         mainLayout.addWidget(self.profileFrame, 0, Qt.AlignTop)
         """
-        browserFrame = BrowserFrame()
-        browserFrame.setStyleSheet(f"background-color: {self.profileFrame.profileArranging.bgColor.name()};")
+        self.browserFrame = BrowserFrame()
+        self.browserFrame.setStyleSheet(f"background-color: {self.profileArranging.bgColor.name()};")
         toolBar = QToolBar()
         toolBar.setIconSize(iface.iconSize(True))
         actionAddGPSLayer = QAction("Add GPX", self)
@@ -277,21 +281,22 @@ class CrayonContainer(QWidget):
         actionAddGPSLayer.triggered.connect(self.addGPXLayer)
         # connect(addLayerAction, & QAction::triggered, this, & QgsElevationProfileWidget::addLayers );
         toolBar.addAction(actionAddGPSLayer)
-        mainStackedWidget = QStackedWidget()
-        mainStackedWidget.addWidget(browserFrame)
-        mainStackedWidget.addWidget(profileFrame)
-        mainStackedWidget.setCurrentWidget(browserFrame)
+        self.mainStackedWidget = QStackedWidget()
+        self.mainStackedWidget.addWidget(self.browserFrame)
+        self.mainStackedWidget.addWidget(self.profileFrame)
+        self.mainStackedWidget.setCurrentWidget(self.browserFrame)
         mainLayout = QVBoxLayout()
         mainLayout.setContentsMargins(0, 0, 0, 0)
         mainLayout.addWidget(toolBar, 0, Qt.AlignTop)
-        mainLayout.addWidget(mainStackedWidget, 0, Qt.AlignTop)
+        mainLayout.addWidget(self.mainStackedWidget, 0, Qt.AlignTop)
         mainLayout.addStretch()
         self.setLayout(mainLayout)
 
     def addGPXLayer(self):
         fileName = QFileDialog.getOpenFileName(self,
             'Open GPX file',
-            QFileInfo(QDir.homePath()).absoluteFilePath(),
+            # QFileInfo(QDir.homePath()).absoluteFilePath(),
+            'C:/Users/Pavel/QField/cloud/new_kmv',
             "GPX files (*.gpx *.GPX)"
         )
         if not fileName or not isinstance(fileName, tuple) or fileName[0] == '':
@@ -306,33 +311,44 @@ class CrayonContainer(QWidget):
             )
             return
         print(f'full path = {fileName[0]}, file name = {fileInfo.baseName()}')
-        vList = []
-        # for vType in ('routes'):
+        vDict = {}
+        for vType in ('routes', 'tracks'):
             # v = QgsVectorLayer(
             #     fileName[0] + "?type=" + vType,
             #     fileInfo.baseName() + "_" + vType,
             #     "gpx"
             # )
-        vType = 'routes'
-        v = QgsVectorLayer(
-            fileName[0] + "|layername=" + vType,
-            fileInfo.baseName() + "_" + vType,
-            "ogr"
-        )
-        if v.isValid():
-            print(f'Appending GPX file: {v.sourceName()}')
-            vList.append(v)
+            v = QgsVectorLayer(
+                fileName[0] + "|layername=" + vType,
+                fileInfo.baseName() + "_" + vType,
+                "ogr"
+            )
+            if v.isValid():
+                print(f'Appending GPX file: {v.sourceName()} with {vType}')
+                vDict[vType] = v
         res = []
-        for v in vList:
+        for vType, v in vDict.items():
             fs = v.getFeatures()
             # Need to get a single multiline
             gl = [fe.geometry() for fe in fs]
             if len(gl) > 0:
-                geom = gl[0]
-                ls = geom.get()
-                print(f'z[0] = {ls.pointN(0).z()}, type = {type(ls.pointN(0).z())}')
-                point0 = ls.coordinateSequence()[0][0][0]
-                print(f'p.z[0] = {point0.z()}, type = {type(point0.z())}')
+                # geom = gl[0]
+                # ls = geom.get()
+                # print(f' Type = {vType}, Length =  {ls.length()}, numPoints = {ls.numPoints()}')
+                # print(f'z[0] = {ls.pointN(0).z()}, type = {type(ls.pointN(0).z())}')
+                # point0 = ls.coordinateSequence()[0][0][0]
+                # print(f'p.z[0] = {point0.z()}, type = {type(point0.z())}')
+                profileData = profile_module.ProfileData(gl[0], self.profileArranging)
+                print(f' Profile: numPoints = {profileData.lineString.numPoints()}')
+                print(f'dataImage {type(profileData.dataImage)}')
+                self.profileFrame.setProfile(profileData)
+                print('setProfile end')
+                self.profileFrame.updateView()
+                print('updateView end')
+                self.mainStackedWidget.setCurrentWidget(self.profileFrame)
+                print(f' rowCount = {self.profileFrame.profileView.model().rowCount()}')
+                print(f' columnCount = {self.profileFrame.profileView.model().columnCount()}')
+                return
 
 
 class BrowserFrame(QFrame):
