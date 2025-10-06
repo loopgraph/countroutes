@@ -24,13 +24,26 @@ The module declares following classes:
 import os
 from console.console import PythonConsole
 import importlib.util
+import weakref
 
 from qgis.utils import iface
+from qgis.gui import QgsRubberBand
 from qgis.core import (
     QgsApplication,
     QgsVectorLayer,
     QgsVertexId,
     Qgis,
+    QgsSimpleLineSymbolLayer,
+    QgsMarkerLineSymbolLayer,
+    QgsSimpleMarkerSymbolLayer,
+    QgsMarkerSymbol,
+    QgsLineSymbol,
+    QgsUnitTypes,
+    QgsRectangle,
+    QgsWkbTypes,
+    QgsLineString,
+    QgsDistanceArea,
+    QgsGeometryUtils,
 )
 from qgis.PyQt.QtWidgets import (
     QWidget,
@@ -265,9 +278,11 @@ class CrayonContainer(QWidget):
         # self.stackedWidget.setSizePolicy(QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed))
         # Making horizontal layout box with parts of profile widgets
         # Creating QFrame of profile page
-        self.profileFrame = profile_module.ProfileFrame()
+        self.profileFrame = profile_module.ProfileFrame(iface.mapCanvas())
+        self.rubberBandLineRef = weakref.ref(self.profileFrame.rubberBandLine)
+        self.rubberBandPointRef = weakref.ref(self.profileFrame.rubberBandPoint)
         self.profileArranging = self.profileFrame.profileArranging
-
+        self.originalExtent = None
         # Creating main layout
         """
         mainLayout.addWidget(self.profileFrame, 0, Qt.AlignTop)
@@ -291,6 +306,28 @@ class CrayonContainer(QWidget):
         mainLayout.addWidget(self.mainStackedWidget, 0, Qt.AlignTop)
         mainLayout.addStretch()
         self.setLayout(mainLayout)
+
+    @property
+    def rubberBandLine(self):
+        return self.rubberBandLineRef()
+
+    @property
+    def rubberBandPoint(self):
+        return self.rubberBandPointRef()
+
+    def removeRubbers(self):
+        flag = False
+        if self.rubberBandLine:
+            iface.mapCanvas().scene().removeItem(self.rubberBandLine)
+            # self.rubberBandLine.reset()
+            flag = True
+        if self.rubberBandPoint:
+            iface.mapCanvas().scene().removeItem(self.rubberBandPoint)
+            # self.rubberBandPoint.reset()
+            flag = True
+        if flag and self.originalExtent is not None:
+            iface.mapCanvas().setExtent(self.originalExtent)
+            iface.mapCanvas().refresh()
 
     def addGPXLayer(self):
         fileName = QFileDialog.getOpenFileName(self,
@@ -338,9 +375,11 @@ class CrayonContainer(QWidget):
                 # print(f'z[0] = {ls.pointN(0).z()}, type = {type(ls.pointN(0).z())}')
                 # point0 = ls.coordinateSequence()[0][0][0]
                 # print(f'p.z[0] = {point0.z()}, type = {type(point0.z())}')
-                profileData = profile_module.ProfileData(gl[0], self.profileArranging)
+                geom = gl[0]
+                profileData = profile_module.ProfileData(self.profileArranging, geom)
                 print(f' Profile: numPoints = {profileData.lineString.numPoints()}')
                 print(f'dataImage {type(profileData.dataImage)}')
+                self.originalExtent = iface.mapCanvas().extent()
                 self.profileFrame.setProfile(profileData)
                 print('setProfile end')
                 self.profileFrame.updateView()
@@ -348,7 +387,6 @@ class CrayonContainer(QWidget):
                 self.mainStackedWidget.setCurrentWidget(self.profileFrame)
                 print(f' rowCount = {self.profileFrame.profileView.model().rowCount()}')
                 print(f' columnCount = {self.profileFrame.profileView.model().columnCount()}')
-                return
 
 
 class BrowserFrame(QFrame):

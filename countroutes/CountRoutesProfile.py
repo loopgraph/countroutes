@@ -23,11 +23,28 @@ The module declares following classes:
     ProfileModel(QAbstractTableModel)
     ProfileDelegate(QAbstractItemDelegate)
 """
+from qgis.utils import iface
+from qgis.gui import (
+    QgsRubberBand,
+    QgsMapCanvas,
+)
 from qgis.core import (
     QgsLineString,
     QgsGeometry,
     QgsDistanceArea,
     QgsPointXY,
+    QgsPoint,
+    QgsWkbTypes,
+    QgsApplication,
+    QgsLineSymbol,
+    QgsSimpleLineSymbolLayer,
+    QgsUnitTypes,
+    QgsMarkerLineSymbolLayer,
+    QgsSimpleMarkerSymbolLayer,
+    QgsMarkerSymbol,
+    Qgis,
+    QgsCoordinateReferenceSystem,
+    QgsVectorLayer,
 )
 from dataclasses import dataclass, field
 from qgis.PyQt.QtGui import (
@@ -51,6 +68,7 @@ from qgis.PyQt.QtCore import (
     QTimer,
     QPoint,
     QByteArray,
+    QObject,
 )
 from qgis.PyQt.QtWidgets import (
     QAbstractItemDelegate,
@@ -101,6 +119,7 @@ class ProfileArranging:
     Y_DATA_FORMAT: str = "{: 7.2f} m"
     X_DATA_FORMAT: str = "{:^6.3f} km"
     G_DATA_FORMAT: str = "{: 2.2f} °"
+    marginPercent: float = 0.05
     LABEL_WEIGHT: QFont.Weight = field(default_factory=lambda: QFont.Medium)
     HEADER_WEIGHT: QFont.Weight = field(default_factory=lambda: QFont.Bold)
     INFO_WEIGHT: QFont.Weight = field(default_factory=lambda: QFont.Normal)
@@ -248,8 +267,8 @@ class ProfileArranging:
 
 @dataclass
 class ProfileData:
-    geometry: QgsGeometry
     profileArranging: ProfileArranging
+    geometry: QgsGeometry
     minRowsLimit: int = 10
     minColumnsLimit: int = 10
     minDistance = 0.001
@@ -257,6 +276,7 @@ class ProfileData:
     totalData: dict = field(default_factory=lambda: {})
     model: QStandardItemModel = field(init=False)
     rows: list = field(init=False)
+    odometer: list = field(init=False)
     xAxisData: list = field(init=False)
     yAxisData: list = field(init=False)
     dataImage: QImage = field(init=False)
@@ -269,6 +289,7 @@ class ProfileData:
     maxYTooltipDataWidth: int = field(init=False)
     maxXAxisDataWidth: int = field(init=False)
     maxYAxisDataWidth: int = field(init=False)
+    distanceArea: QgsDistanceArea = field(init=False)
 
     def __post_init__(self):
         if (
@@ -279,25 +300,16 @@ class ProfileData:
                 self.profileArranging.FIG_WIDTH - 2 >= self.minColumnsLimit and
                 self.profileArranging.METERS_RATIO > 0
         ):
-            """
-                new_point = QgsPoint(point.x(), point.y(), m=accumulated_distance)
-            # Создаём линию
-            line_string = QgsLineString(new_points)
-            """
             # Creation a copy of geometry to remove duplicate nodes
             self.lineString = self.geometry.get()
             self.lineString.removeDuplicateNodes()
             # Calculating geometry length in Ellipsoidal coordinate system
-            distance = QgsDistanceArea()
-            distance.setEllipsoid("WGS84")
+            self.distanceArea = QgsDistanceArea()
+            self.distanceArea.setEllipsoid("WGS84")
             # The distance of the profile route
-            totalLength = distance.measureLength(self.geometry)  # In meters!!!
+            totalLength = self.distanceArea.measureLength(self.geometry)  # In meters!!!
             if totalLength == 0.0:
-                self.model = None
-                self.dataImage = None
-                self.lineString = None
-                self.rows = []
-                self.yAxisData = []
+                self.setNone()
                 return
             # The interval per a column (The first and the last columns are without data)
             dX = totalLength / (self.profileArranging.FIG_WIDTH - 2)
@@ -320,7 +332,7 @@ class ProfileData:
             # There is an offset of the 0-column due to y-axis, the 1-column consists the first point
             modulation.append((1, 0.0))     # 0-point is in the 1-column
             for i in range(1, self.lineString.numPoints()):
-                dist = distance.measureLine(
+                dist = self.distanceArea.measureLine(
                     QgsPointXY(self.lineString.pointN(i - 1)),
                     QgsPointXY(self.lineString.pointN(i))
                 )
@@ -402,12 +414,17 @@ class ProfileData:
             xToolTipLen = 0
             maxCur = ''
             maxXTooltip = ''
+            self.odometer = []
             for i in range(self.profileArranging.FIG_WIDTH):
                 self.model.setItem(i, browsed[names.curElevation], QStandardItem(''))
                 self.model.setItem(i, browsed[names.curGradient], QStandardItem(''))
                 if i in (0, self.profileArranging.FIG_WIDTH - 1):
                     self.model.setItem(i, browsed[names.xTooltip], QStandardItem(''))
                     self.model.setItem(i, browsed[names.curFoot], QStandardItem(''))
+                    if i:
+                        self.odometer.append(totalLength)
+                    else:
+                        self.odometer.append(0.0)
                 else:
                     curFoot = styling(foot, names.curFoot)
                     if len(curFoot) > curFootLen:
@@ -419,6 +436,7 @@ class ProfileData:
                         maxXTooltip = xTooltip
                     self.model.setItem(i, browsed[names.xTooltip], QStandardItem(xTooltip))
                     self.model.setItem(i, browsed[names.curFoot], QStandardItem(curFoot))
+                    self.odometer.append(foot * self.profileArranging.METERS_RATIO)
                 self.model.setItem(i, browsed[names.curLog], QStandardItem(''))
                 self.model.setItem(i, browsed[names.yTooltip], QStandardItem(''))
                 foot += dX / self.profileArranging.METERS_RATIO
@@ -526,7 +544,6 @@ class ProfileData:
             # Creating data for table view model
             pixelDataRGB = []
             alpha = 255
-
             self.rows = []
             for row in range(self.profileArranging.FIG_HEIGHT):
                 for column in range(self.profileArranging.FIG_WIDTH):
@@ -591,11 +608,16 @@ class ProfileData:
                 QImage.Format_ARGB32
             )
         else:
-            self.model = None
-            self.dataImage = None
-            self.rows = []
-            self.yAxisData = []
-            self.rowsCount = 0
+            self.setNone()
+
+    def setNone(self):
+        self.model = None
+        self.dataImage = None
+        self.lineString = None
+        self.rows = []
+        self.odometer = []
+        self.yAxisData = []
+        self.rowsCount = 0
 
 
 class ProfileModel(QAbstractTableModel):
@@ -785,7 +807,7 @@ class ProfileTable(QTableView):
     # The signal is meant to change gray color of xLabels and yLabels
     isHover = pyqtSignal(bool)
     # The signal is meant to change values according to the pointer
-    setTooltipData = pyqtSignal(object)
+    setTooltipData = pyqtSignal(object, object)
     showTooltips = pyqtSignal()
     hideTooltips = pyqtSignal()
 
@@ -823,7 +845,7 @@ class ProfileTable(QTableView):
                 self.showTooltips.emit()
             if index.column() != self.model().getHoverColumn():
                 self.updatePointer(index)
-                self.setTooltipData.emit(index)
+                self.setTooltipData.emit(event.pos(), index)
         # elif event.buttons() == Qt.LeftButton:
         #     index = QModelIndex(self.indexAt(event.pos()))
         #     self.select(index.column())
@@ -933,14 +955,17 @@ class ProfileTable(QTableView):
 
 
 class ProfileFrame(QFrame):
+    tracer = pyqtSignal(object, object)
 
-    def __init__(self, parent=None):
+    def __init__(self, canvas=iface.mapCanvas(), parent=None):
         super().__init__(parent)
         self.isPaintingFinished = False
         self.xLabelsLevel = None
         self.yLabelsLevel = None
         self.xTooltipPositions = None
         self.yTooltipPositions = None
+        self.odometer = Odometer()
+        self.vectorLayer = None
         self.profileArranging = ProfileArranging()
         self.setFrameStyle(QFrame.Panel | QFrame.Sunken)
         self.setStyleSheet(f"background-color: {self.profileArranging.bgColor.name()};")
@@ -1046,6 +1071,9 @@ class ProfileFrame(QFrame):
         self.profileView.setTooltipData.connect(self.updateCurrents)
         self.profileView.showTooltips.connect(self.showTooltips)
         self.profileView.hideTooltips.connect(self.hideTooltips)
+        self.rubberBandLine = ProfileRubberBandLine(canvas)
+        self.rubberBandPoint = ProfileRubberBandPoint(canvas)
+        self.tracer.connect(self.showTracer)
 
     def setMapModel(self, profile):
         # As after setting new model in mapper: QDataWidgetMapper
@@ -1078,8 +1106,19 @@ class ProfileFrame(QFrame):
             self.totalLabels[name].setText(val)
             self.totalLabels[name].setFixedWidth(profile.maxTotalDataWidth)
         self.profileView.model().changeProfileData(profile)
+        self.odometer.setOdometer(profile.odometer)
+        if self.rubberBandLine.setToGeometry(profile.geometry, profile.distanceArea):
+            self.rubberBandLine.updatePosition()
+            self.rubberBandLine.show()
+        rect = profile.geometry.boundingBox()
+        marginRect = rect.buffered(min(
+            rect.width() * profile.profileArranging.marginPercent,
+            rect.height() * profile.profileArranging.marginPercent
+        ))
+        iface.mapCanvas().setExtent(marginRect)
+        iface.mapCanvas().refresh()
 
-    def updateCurrents(self, index):
+    def updateCurrents(self, point: QgsPointXY, index):
         # Inputting index has a row as y-value and a column as x-value from table view
         # Getting current row to set curve position of the y-axis tooltip
         row = self.profileView.model().getRow(index.column())
@@ -1097,9 +1136,17 @@ class ProfileFrame(QFrame):
             self.xTooltipPositions[index.column()],
             self.xLabelsLevel
         )))
-        # names = self.profileArranging.sectNames
-        # idx = self.mapper.model().index(index.column(), len(self.profileArranging.sectNames._fields))
-        # print(f' foot = {self.mapper.model().data(idx, Qt.DisplayRole)}')
+        # Emitting a signal to trace a position on the map canvas
+        self.odometer.setDistance(index.column())
+        self.tracer.emit(point, self.odometer)
+
+    def showTracer(self, pointXY, odometer):
+        point = self.rubberBandLine.getPointVersusDistance(odometer.distance())
+        if not point.isEmpty():
+            self.rubberBandPoint.setToGeometry(QgsGeometry(point), None)
+            self.rubberBandPoint.show()
+        else:
+            self.rubberBandPoint.hide()
 
     def layoutWidgets(self):
         # Initializing layouts
@@ -1257,3 +1304,132 @@ class ProfileFrame(QFrame):
     def updateView(self):
         self.profileView.resizeColumnsToContents()
         self.profileView.resizeRowsToContents()
+
+
+class ProfileRubberBandLine(QgsRubberBand):
+    def __init__(self, mapCanvas=iface.mapCanvas()):
+        super().__init__(mapCanvas, QgsWkbTypes.LineGeometry)
+        self.setZValue(1000)
+        self.setWidth(QgsApplication.scaleIconSize(2))
+        symbol = QgsLineSymbol()
+        bottomLayer = QgsSimpleLineSymbolLayer()
+        bottomLayer.setWidth(0.8)
+        bottomLayer.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+        bottomLayer.setColor(QColor(40, 40, 40, 100))
+        bottomLayer.setPenCapStyle(Qt.PenCapStyle.FlatCap)
+        symbol.appendSymbolLayer(bottomLayer)
+        arrowLayer = QgsMarkerLineSymbolLayer()
+        arrowLayer.setPlacements(Qgis.MarkerLinePlacement.CentralPoint)
+        markerSymbol = QgsMarkerSymbol()
+        arrowSymbolLayer = QgsSimpleMarkerSymbolLayer(Qgis.MarkerShape.EquilateralTriangle)
+        arrowSymbolLayer.setSize(4)
+        arrowSymbolLayer.setAngle(90)
+        arrowSymbolLayer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+        arrowSymbolLayer.setColor(QColor(40, 40, 40, 100))
+        arrowSymbolLayer.setStrokeColor(QColor(255, 255, 255, 255))
+        arrowSymbolLayer.setStrokeWidth(0.2)
+        markerSymbol.appendSymbolLayer(arrowSymbolLayer)
+        arrowLayer.setSubSymbol(markerSymbol)
+        symbol.appendSymbolLayer(arrowLayer)
+        topLayer = QgsSimpleLineSymbolLayer()
+        topLayer.setWidth(0.4)
+        topLayer.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+        topLayer.setColor(QColor(255, 255, 255, 255))
+        topLayer.setPenStyle(Qt.DashLine)
+        topLayer.setPenCapStyle(Qt.PenCapStyle.FlatCap)
+        symbol.appendSymbolLayer(topLayer)
+        self.setSymbol(symbol)
+        self._lineString = None
+        self.vertices = None
+        self.distanceArea = None
+
+    def setToGeometry(self, geometry, distanceArea):
+        if geometry.isEmpty():
+            return False
+        self.vertices = geometry.asPolyline()
+        if len(self.vertices) < 2:
+            self.vertices = None
+            return False
+        self.distanceArea = distanceArea
+        super().setToGeometry(geometry, None)
+        if Qgis.QGIS_VERSION_INT >= 34000:
+            self._lineString = QgsLineString(self.vertices)
+        return True
+
+    def getPointVersusDistance(self, distance):
+        if self._lineString is not None:
+            return self._lineString.interpolatePoint(distance)
+        if self.vertices is None:
+            return QgsGeometry()
+        count = 0.0
+        for i in range(1, len(self.vertices)):
+            p1 = self.vertices[i - 1]
+            p2 = self.vertices[i]
+            segmentLength = self.distanceArea.measureLine(
+                QgsPointXY(p1),
+                QgsPointXY(p2)
+            )
+            if count + segmentLength >= distance:
+                # Line interpolation
+                t = (distance - count) / segmentLength
+                x = p1.x() + t * (p2.x() - p1.x())
+                y = p1.y() + t * (p2.y() - p1.y())
+                return QgsPoint(x, y)
+            count += segmentLength
+        # If the distance is more than line length then return the last point
+        return QgsPoint(self.vertices[-1])
+
+
+class ProfileRubberBandPoint(QgsRubberBand):
+    def __init__(self, mapCanvas=iface.mapCanvas()):
+        super().__init__(mapCanvas, QgsWkbTypes.PointGeometry)
+        self.setZValue(1000)
+        self.setIcon(QgsRubberBand.ICON_FULL_DIAMOND)
+        self.setWidth(QgsApplication.scaleIconSize(8))
+        self.setIconSize(QgsApplication.scaleIconSize(4))
+        self.setSecondaryStrokeColor(QColor(255, 255, 255, 100))
+        self.setColor(QColor(0, 0, 0))
+        self.hide()
+
+
+class Odometer(QObject):
+    def __init__(self, odometer=None, parent=None):
+        super().__init__(parent)
+        if (
+            isinstance(odometer, list) and
+                len(odometer) > 1 and
+                all(isinstance(value, (int, float)) for value in odometer) and
+                all(odometer[i] <= odometer[i + 1] for i in range(len(odometer) - 1))
+        ):
+            self._odometer = odometer
+            self._distance = 0.0
+            self._limit = odometer[-1]
+        else:
+            self._odometer = []
+            self._distance = 0.0
+            self._limit = 0.0
+
+    def setOdometer(self, odometer):
+        if (
+            isinstance(odometer, list) and
+                len(odometer) > 1 and
+                all(isinstance(value, (int, float)) for value in odometer) and
+                all(odometer[i] <= odometer[i + 1] for i in range(len(odometer) - 1))
+        ):
+            self._odometer = odometer
+            self._distance = 0.0
+            self._limit = odometer[-1]
+        else:
+            self._odometer = []
+            self._distance = 0.0
+            self._limit = 0.0
+
+    def setDistance(self, column):
+        try:
+            self._distance = self._odometer[column]
+        except:
+            pass
+
+    def distance(self):
+        return self._distance
+
