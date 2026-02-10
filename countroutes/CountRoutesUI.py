@@ -44,6 +44,7 @@ from qgis.core import (
     QgsLineString,
     QgsDistanceArea,
     QgsGeometryUtils,
+    QgsProject,
 )
 from qgis.PyQt.QtWidgets import (
     QWidget,
@@ -55,7 +56,6 @@ from qgis.PyQt.QtWidgets import (
     QMenu,
     QToolBar,
     QToolButton,
-    QAction,
     QLabel,
     QFrame,
     QStackedWidget,
@@ -298,8 +298,11 @@ class CrayonContainer(QWidget):
         toolBar.addAction(actionAddGPSLayer)
         self.mainStackedWidget = QStackedWidget()
         self.mainStackedWidget.addWidget(self.browserFrame)
+        print(f'browserFrame size = {self.browserFrame.size()}')
         self.mainStackedWidget.addWidget(self.profileFrame)
+        print(f'profileFrame size = {self.profileFrame.size()}')
         self.mainStackedWidget.setCurrentWidget(self.browserFrame)
+        print(f'mainStackedWidget size = {self.mainStackedWidget.size()}')
         mainLayout = QVBoxLayout()
         mainLayout.setContentsMargins(0, 0, 0, 0)
         mainLayout.addWidget(toolBar, 0, Qt.AlignTop)
@@ -363,20 +366,24 @@ class CrayonContainer(QWidget):
             if v.isValid():
                 print(f'Appending GPX file: {v.sourceName()} with {vType}')
                 vDict[vType] = v
-        res = []
         for vType, v in vDict.items():
             fs = v.getFeatures()
             # Need to get a single multiline
             gl = [fe.geometry() for fe in fs]
             if len(gl) > 0:
+                # print(f'Before addMapLayer: type = {type(v.elevationProperties())}, hasElavation = {v.elevationProperties().hasElevation()}')
+                # QgsProject.instance().addMapLayer(v)
                 # geom = gl[0]
                 # ls = geom.get()
                 # print(f' Type = {vType}, Length =  {ls.length()}, numPoints = {ls.numPoints()}')
                 # print(f'z[0] = {ls.pointN(0).z()}, type = {type(ls.pointN(0).z())}')
                 # point0 = ls.coordinateSequence()[0][0][0]
                 # print(f'p.z[0] = {point0.z()}, type = {type(point0.z())}')
-                geom = gl[0]
-                profileData = profile_module.ProfileData(self.profileArranging, geom)
+                vect = iface.activeLayer()
+                # geom = gl[0]
+                gl0 = [fe.geometry() for fe in vect.getFeatures()]
+                profileData = profile_module.ProfileData(self.profileArranging, gl0[0], vect)
+                # profileData = profile_module.ProfileData(self.profileArranging, geom, v)
                 print(f' Profile: numPoints = {profileData.lineString.numPoints()}')
                 print(f'dataImage {type(profileData.dataImage)}')
                 self.originalExtent = iface.mapCanvas().extent()
@@ -385,9 +392,6 @@ class CrayonContainer(QWidget):
                 self.profileFrame.updateView()
                 print('updateView end')
                 self.mainStackedWidget.setCurrentWidget(self.profileFrame)
-                print(f' rowCount = {self.profileFrame.profileView.model().rowCount()}')
-                print(f' columnCount = {self.profileFrame.profileView.model().columnCount()}')
-
 
 class BrowserFrame(QFrame):
     def __init__(
@@ -396,13 +400,13 @@ class BrowserFrame(QFrame):
     ):
         super().__init__(parent)
         frameLayout = QVBoxLayout()
-        self.setLayout(frameLayout)
-        self.layout().setContentsMargins(0, 0, 0, 0)
-        self.layout().setSpacing(0)
         self.browserView = QTreeView(self)
         frameLayout.addWidget(self.browserView)
         frameLayout.addStretch()
         frameLayout.setSpacing(0)
+        self.setLayout(frameLayout)
+        self.layout().setContentsMargins(0, 0, 0, 0)
+        self.layout().setSpacing(0)
 
 
 """

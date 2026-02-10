@@ -27,6 +27,7 @@ from qgis.utils import iface
 from qgis.gui import (
     QgsRubberBand,
     QgsMapCanvas,
+    QgsPlotToolPan,
 )
 from qgis.core import (
     QgsLineString,
@@ -45,7 +46,11 @@ from qgis.core import (
     Qgis,
     QgsCoordinateReferenceSystem,
     QgsVectorLayer,
+    QgsProject,
+    QgsProfilePlotRenderer,
 )
+if Qgis.QGIS_VERSION_INT >= 32600:
+    from qgis.gui import QgsElevationProfileCanvas
 from dataclasses import dataclass, field
 from qgis.PyQt.QtGui import (
     QFont,
@@ -57,6 +62,7 @@ from qgis.PyQt.QtGui import (
     QStandardItemModel,
     QStandardItem,
     QPixmap,
+    QPainter,
 )
 from qgis.PyQt.QtCore import (
     QAbstractTableModel,
@@ -97,7 +103,7 @@ class ProfileRoles(Enum):
 @dataclass
 class ProfileArranging:
     FIG_HEIGHT: int = 150
-    FIG_WIDTH: int = 475
+    FIG_WIDTH: int = 350
     dataRowsCount: int = 130
     V_LINES_GRID: int = 3
     H_LINES_GRID: int = 5
@@ -149,7 +155,6 @@ class ProfileArranging:
     sectNames: namedtuple = field(init=False)
     browsedInfo: dict = field(init=False)
 
-
     def __post_init__(self):
         self.labelFont = QFont(self.FONT_FAMILY, self.LABEL_POINT_SIZE, weight=self.LABEL_WEIGHT)
         fm = QFontMetrics(self.labelFont)
@@ -192,7 +197,8 @@ class ProfileArranging:
             'minGradient',
             'maxGradient',
             'xTooltip',
-            'yTooltip'
+            'yTooltip',
+            'pointXY',
         ]
         titles = [
             'Proj Distance',
@@ -219,6 +225,7 @@ class ProfileArranging:
             names.curLog,
             names.xTooltip,
             names.yTooltip,
+            names.pointXY,
         ]
         totals = [
             names.maxElevation,
@@ -269,6 +276,7 @@ class ProfileArranging:
 class ProfileData:
     profileArranging: ProfileArranging
     geometry: QgsGeometry
+    vectorLayer: QgsVectorLayer
     minRowsLimit: int = 10
     minColumnsLimit: int = 10
     minDistance = 0.001
@@ -290,6 +298,8 @@ class ProfileData:
     maxXAxisDataWidth: int = field(init=False)
     maxYAxisDataWidth: int = field(init=False)
     distanceArea: QgsDistanceArea = field(init=False)
+    minElevation: float = field(init=False)
+    maxElevation: float = field(init=False)
 
     def __post_init__(self):
         if (
@@ -330,7 +340,7 @@ class ProfileData:
             gradient = 0.0
             gradients = [gradient]  # Setting gradient of 0-point in degrees!!!
             # There is an offset of the 0-column due to y-axis, the 1-column consists the first point
-            modulation.append((1, 0.0))     # 0-point is in the 1-column
+            modulation.append((1, 0.0))  # 0-point is in the 1-column
             for i in range(1, self.lineString.numPoints()):
                 dist = self.distanceArea.measureLine(
                     QgsPointXY(self.lineString.pointN(i - 1)),
@@ -354,7 +364,7 @@ class ProfileData:
                 # Calculating a gradient between two points in degrees
                 gradient = math.degrees(math.atan(dEval / dist))
                 # Adding gradient values for each vertex
-                gradients.append(gradient)    # In degrees!!!
+                gradients.append(gradient)  # In degrees!!!
                 # Getting max and min gradients of the route
                 if gradient > maxGradient:
                     maxGradient = gradient
@@ -369,6 +379,8 @@ class ProfileData:
                     self.rowsCount = dataRows
             else:
                 self.rowsCount = 1
+            self.minElevation = minElevation
+            self.maxElevation = maxElevation
             print(f'ProfileData: minE = {minElevation}, maxE = {maxElevation}, dX = {dX}')
             print(f'  Rows values limit = {self.rowsCount}')
             # modDict - a dictionary of columns with a list of point numbers:
@@ -423,68 +435,74 @@ class ProfileData:
                     self.model.setItem(i, browsed[names.curFoot], QStandardItem(''))
                     if i:
                         self.odometer.append(totalLength)
+                        item = QStandardItem()
+                        item.setData(QgsGeometry(self.getQgsPoint(totalLength)), Qt.DisplayRole)
+                        self.model.setItem(i, browsed[names.pointXY], item)
                     else:
                         self.odometer.append(0.0)
+                        item = QStandardItem()
+                        item.setData(QgsGeometry(self.getQgsPoint(0.0)), Qt.DisplayRole)
+                        self.model.setItem(i, browsed[names.pointXY], item)
                 else:
-                    curFoot = styling(foot, names.curFoot)
+                    curFoot = styling(foot / self.profileArranging.METERS_RATIO, names.curFoot)
                     if len(curFoot) > curFootLen:
                         curFootLen = len(curFoot)
                         maxCur = curFoot
-                    xTooltip = styling(foot, names.xTooltip)
+                    xTooltip = styling(foot / self.profileArranging.METERS_RATIO, names.xTooltip)
                     if len(xTooltip) > xToolTipLen:
                         xToolTipLen = len(xTooltip)
                         maxXTooltip = xTooltip
                     self.model.setItem(i, browsed[names.xTooltip], QStandardItem(xTooltip))
                     self.model.setItem(i, browsed[names.curFoot], QStandardItem(curFoot))
-                    self.odometer.append(foot * self.profileArranging.METERS_RATIO)
+                    self.odometer.append(foot)
+                    item = QStandardItem()
+                    item.setData(QgsGeometry(self.getQgsPoint(foot)), Qt.DisplayRole)
+                    self.model.setItem(i, browsed[names.pointXY], item)
                 self.model.setItem(i, browsed[names.curLog], QStandardItem(''))
                 self.model.setItem(i, browsed[names.yTooltip], QStandardItem(''))
-                foot += dX / self.profileArranging.METERS_RATIO
+                foot += dX
             fontMetrics = QFontMetrics(self.profileArranging.infoFont)
             rows = {row: None for row in range(self.profileArranging.FIG_WIDTH)}
             log = 0.0
             maxYTooltip = ''
             # Populating the model and y-values(rows)
             for i in range(1, self.profileArranging.FIG_WIDTH - 1):
+                idx = bisect.bisect_right(sortedKeys, i)
                 # Cases for i-column:
                 #   1 - no points (i is not a key of modDict), but the first point in the 0 column,
                 #   2 - points have place.
                 if i not in modDict:  # No points in the i-column
                     # idx = bisect.bisect_left(sortedKeys, i) - 1   # Should be >= 0
                     # leftColumn = sortedKeys[idx]
-                    idx = bisect.bisect_right(sortedKeys, i)
                     if idx < len(sortedKeys):
                         rightColumn = sortedKeys[idx]
                         rightPoint = modDict[rightColumn][0]
                         gradient = gradients[rightPoint]
-                        elevation1 = elevation2 = (dX * (rightColumn - i) *
-                                                   math.tan(math.radians(gradient)) + self.lineString.zAt(rightPoint)
-                                                   )
-                        row1 = row2 = bOffset - int((elevation1 - minElevation) / dY + 0.5)
+                        elevation = (dX * (rightColumn - i) *
+                            math.tan(math.radians(gradient)) + self.lineString.zAt(rightPoint)
+                        )
+                        row1 = row2 = bOffset - int((elevation - minElevation) / dY + 0.5)
                         cs = math.cos(math.radians(gradient))
                         if cs == 0.0:
                             cs = 1
                         log += dX / cs / self.profileArranging.METERS_RATIO
-                        gradient1 = gradient2 = gradient
                     else:  # There is no curve on the right columns
                         break
-                else:   # Calculating a log of points in the i-column
+                else:  # Calculating a log of points in the i-column
+                    # Determining min-max evaluations and its rows for different points in the column
+                    elvL = [self.lineString.zAt(e) for e in modDict[i]]
+                    elevation1 = min(elvL)
+                    row1 = bOffset - int((elevation1 - minElevation) / dY + 0.5)
+                    elevation2 = max(elvL)
+                    row2 = bOffset - int((elevation2 - minElevation) / dY + 0.5)
                     # 1) Calculating the log from the left column to the first point
-                    gradient = gradients[modDict[i][0]]
-                    cs = math.cos(math.radians(gradient))
+                    cs = math.cos(math.radians(gradients[modDict[i][0]]))
                     if cs == 0.0:
                         cs = 1
                     deltaX = modulation[modDict[i][0]][1] * dX
                     logLeft = deltaX / abs(cs)
                     # 2) Calculating the logs between points in the column
-                    logPoints = 0.0
-                    gradient1 = gradient2 = gradient
-                    for j in modDict[i][1:]:
-                        logPoints += pointSlants[j]
-                        if gradients[j] < gradient1:
-                            gradient1 = gradients[j]
-                        if gradients[j] > gradient2:
-                            gradient2 = gradients[j]
+                    logPoints = sum([pointSlants[j] for j in modDict[i][1:]])
                     # 3) Calculating the log from the last point to the right column
                     logRight = 0.0
                     if modDict[i][-1] + 1 < self.lineString.numPoints():
@@ -499,20 +517,19 @@ class ProfileData:
                         pass
                     # Total log of the curve in the column
                     log += (logLeft + logPoints + logRight) / self.profileArranging.METERS_RATIO
-                    # Calculating min and max values of evaluation in the column
-                    elvL = [self.lineString.zAt(e) for e in modDict[i]]
-                    elevation1 = min(elvL)
-                    row1 = bOffset - int((elevation1 - minElevation) / dY + 0.5)
-                    elevation2 = max(elvL)
-                    row2 = bOffset - int((elevation2 - minElevation) / dY + 0.5)
-                eStr = styling(elevation1, names.curElevation)
-                if elevation1 != elevation2:
-                    eStr += ' - ' + styling(elevation2, names.curElevation)
-                gStr = styling(gradient1, names.curGradient)
-                if gradient1 != gradient2:
-                    gStr += ' - ' + styling(gradient2, names.curGradient)
+                    if idx < len(sortedKeys):
+                        rightColumn = sortedKeys[idx]
+                        rightPoint = modDict[rightColumn][0]
+                        gradient = gradients[rightPoint]
+                        elevation = (dX * (rightColumn - i) *
+                            math.tan(math.radians(gradient)) + self.lineString.zAt(rightPoint)
+                        )
+                    else:
+                        pass
+                eStr = styling(elevation, names.curElevation)
+                gStr = styling(gradient, names.curGradient)
                 curLog = styling(log, names.curLog)
-                yTooltip = styling(elevation2, names.yTooltip)
+                yTooltip = styling(elevation, names.yTooltip)
                 maxStr = max([eStr, gStr, curLog], key=len)
                 if len(maxCur) < len(maxStr):
                     maxCur = maxStr
@@ -618,6 +635,22 @@ class ProfileData:
         self.odometer = []
         self.yAxisData = []
         self.rowsCount = 0
+
+    def getQgsPoint(self, distance):
+        count = 0.0
+        for i in range(1, self.lineString.numPoints()):
+            p1 = QgsPointXY(self.lineString.pointN(i - 1))
+            p2 = QgsPointXY(self.lineString.pointN(i))
+            segmentLength = self.distanceArea.measureLine(p1, p2)
+            if count + segmentLength >= distance:
+                # Line interpolation
+                t = (distance - count) / segmentLength
+                x = p1.x() + t * (p2.x() - p1.x())
+                y = p1.y() + t * (p2.y() - p1.y())
+                return QgsPoint(x, y)
+            count += segmentLength
+        # If the distance is more than line length then return the last point
+        return QgsPoint(self.lineString.pointN(self.lineString.numPoints() - 1))
 
 
 class ProfileModel(QAbstractTableModel):
@@ -830,6 +863,10 @@ class ProfileTable(QTableView):
         self.setStyleSheet("border: none")
         self.setFixedWidth(profileArranging.FIG_WIDTH)
         self.setFixedHeight(profileArranging.FIG_HEIGHT)
+        # header = self.horizontalHeader()
+        # header.setDefaultSectionSize(1)
+        # header.setMinimumSectionSize(1)
+        # header.setMaximumSectionSize(1)
         self.setSizePolicy(QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed))
         self.isLeftButtonPressed = False
         # self.sign = lambda x, y: -1 if y - x < -1 else 1 if y - x > 1 else 0
@@ -953,6 +990,62 @@ class ProfileTable(QTableView):
                     self.update(self.model().index(i, idx))
     """
 
+    def changeProfile(self, profile):
+        self.model().changeProfileData(profile)
+
+    def updateView(self):
+        self.resizeColumnsToContents()
+        self.resizeRowsToContents()
+
+
+class ProfileCanvas(QgsElevationProfileCanvas):
+
+    def __init__(self, profileArranging, parent=None):
+        super().__init__(parent)
+        self.setProject(QgsProject.instance())
+        self.setLockAxisScales(False)
+        self.setBackgroundColor(profileArranging.bgColor)
+        panTool = QgsPlotToolPan(self)
+        self.setTool(panTool)
+        self.setDistanceUnit(QgsUnitTypes.DistanceMeters)
+        self.setTolerance(0.1)
+        self.setCrs(QgsProject.instance().crs3D())
+        # self.setFixedWidth(profileArranging.FIG_WIDTH)
+        # self.setFixedHeight(profileArranging.FIG_HEIGHT)
+
+    def changeProfile(self, profile):
+        self.setLayers([profile.vectorLayer])
+        print(f'changeProfile: layers = {[it.name() for it in self.layers()]}')
+        lineString = profile.lineString.clone()
+        # print(f'changeProfile: type = {type(self.profileCurve())}, numPoints ={self.profileCurve().numPoints()}')
+        # self.setVisiblePlotRange(
+        #     0.0, profile.odometer[-1],
+        #     profile.minElevation * (1 - 0.2), profile.maxElevation * (1 + 0.2),
+        # )
+        print(f'Distance = {0.0} - {profile.odometer[-1]}')
+        print(f'Elevation = {profile.minElevation * (1 - 0.2)} - {profile.maxElevation * (1 + 0.2)}')
+        # self.setCrs(QgsCoordinateReferenceSystem("WGS84"))
+        self.setProfileCurve(lineString)
+        # self.invalidateCurrentPlotExtent()
+        self.refresh()
+        print("visibleDistanceRange = ", self.visibleDistanceRange())
+        print("visibleElevationRange = ", self.visibleElevationRange())
+        print(f'changeProfile: plotArea = {self.plotArea()}')
+        # renderer = QgsProfilePlotRenderer(
+        #     self.profilePlot(),
+        #     self.size()
+        # )
+        # image = QImage(self.size(), QImage.Format_ARGB32)
+        # painter = QPainter(image)
+        # renderer.render(painter)
+        # painter.end()
+        # att = dir(self)
+        # for it in att:
+        #     print(it)
+
+    def updateView(self):
+        self.refresh()
+
 
 class ProfileFrame(QFrame):
     tracer = pyqtSignal(object, object)
@@ -970,16 +1063,26 @@ class ProfileFrame(QFrame):
         self.setFrameStyle(QFrame.Panel | QFrame.Sunken)
         self.setStyleSheet(f"background-color: {self.profileArranging.bgColor.name()};")
         self.placeholder = QLabel(self)
-        self.profileView = ProfileTable(self.profileArranging, parent=self)
         # Creating the stacked widget for placeholder and profileView
         self.stackedWidget = QStackedWidget()
         self.stackedWidget.setFixedWidth(self.profileArranging.FIG_WIDTH)
         self.stackedWidget.setFixedHeight(self.profileArranging.FIG_HEIGHT)
         self.stackedWidget.setSizePolicy(QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed))
         self.isStackedWidgetDestroyed = False
-        self.stackedWidget.addWidget(self.profileView)
-        self.stackedWidget.addWidget(self.placeholder)
-        self.stackedWidget.setCurrentWidget(self.placeholder)
+        if Qgis.QGIS_VERSION_INT >= 32600:
+            self.profileView = ProfileCanvas(self.profileArranging, parent=self.stackedWidget)
+            self.stackedWidget.addWidget(self.profileView)
+            # self.stackedWidget.setCurrentWidget(self.profileView)
+        else:
+            self.profileView = ProfileTable(self.profileArranging, parent=self)
+            # Connecting mouse events on table view with data updaters
+            self.profileView.isHover.connect(self.changeLabelsColor)  # For color changing of xLabels and yLabels
+            self.profileView.setTooltipData.connect(self.updateCurrents)
+            self.profileView.showTooltips.connect(self.showTooltips)
+            self.profileView.hideTooltips.connect(self.hideTooltips)
+            self.stackedWidget.addWidget(self.profileView)
+            self.stackedWidget.addWidget(self.placeholder)
+            self.stackedWidget.setCurrentWidget(self.placeholder)
         self.stackedWidget.destroyed.connect(self.stackedWidgetDestroyed)
         # Creating axis labels
         self.xLabels = []
@@ -1066,19 +1169,16 @@ class ProfileFrame(QFrame):
         # Composing widgets in the frame
         profileLayout = self.layoutWidgets()
         self.setLayout(profileLayout)
-        # Connecting mouse events on table view with data updaters
-        self.profileView.isHover.connect(self.changeLabelsColor)  # For color changing of xLabels and yLabels
-        self.profileView.setTooltipData.connect(self.updateCurrents)
-        self.profileView.showTooltips.connect(self.showTooltips)
-        self.profileView.hideTooltips.connect(self.hideTooltips)
         self.rubberBandLine = ProfileRubberBandLine(canvas)
         self.rubberBandPoint = ProfileRubberBandPoint(canvas)
         self.tracer.connect(self.showTracer)
+        # self.isOldVersion = not Qgis.QGIS_VERSION_INT >= 34000
 
     def setMapModel(self, profile):
         # As after setting new model in mapper: QDataWidgetMapper
         #   it needs new widget mapping
         self.mapper.setModel(profile.model)
+        print(f' mapper model = {self.mapper.model()}')
         names = self.profileArranging.sectNames
         for name, it in self.detailsLabels.items():
             it.setText('')
@@ -1092,9 +1192,9 @@ class ProfileFrame(QFrame):
         self.mapper.toFirst()
 
     def setProfile(self, profile):
-        pm = QPixmap.fromImage(profile.dataImage)
-        self.placeholder.setPixmap(pm)
-        self.stackedWidget.setCurrentWidget(self.placeholder)
+        # pm = QPixmap.fromImage(profile.dataImage)
+        # self.placeholder.setPixmap(pm)
+        # self.stackedWidget.setCurrentWidget(self.placeholder)
         for idx, it in enumerate(self.yLabels):
             it.setFixedWidth(profile.maxYAxisDataWidth)
             it.setText(profile.yAxisData[idx])
@@ -1105,9 +1205,10 @@ class ProfileFrame(QFrame):
         for name, val in profile.totalData.items():
             self.totalLabels[name].setText(val)
             self.totalLabels[name].setFixedWidth(profile.maxTotalDataWidth)
-        self.profileView.model().changeProfileData(profile)
+        self.profileView.changeProfile(profile)
         self.odometer.setOdometer(profile.odometer)
-        if self.rubberBandLine.setToGeometry(profile.geometry, profile.distanceArea):
+        if not profile.geometry.isEmpty():
+            self.rubberBandLine.setToGeometry(profile.geometry)
             self.rubberBandLine.updatePosition()
             self.rubberBandLine.show()
         rect = profile.geometry.boundingBox()
@@ -1138,14 +1239,17 @@ class ProfileFrame(QFrame):
         )))
         # Emitting a signal to trace a position on the map canvas
         self.odometer.setDistance(index.column())
+        # The second parameter has a method distance()
         self.tracer.emit(point, self.odometer)
 
     def showTracer(self, pointXY, odometer):
-        point = self.rubberBandLine.getPointVersusDistance(odometer.distance())
-        if not point.isEmpty():
-            self.rubberBandPoint.setToGeometry(QgsGeometry(point), None)
+        names = self.profileArranging.sectNames
+        browsed = self.profileArranging.browsedInfo
+        geom = self.mapper.model().item(int(pointXY.x()), browsed[names.pointXY]).data(Qt.DisplayRole)
+        try:
+            self.rubberBandPoint.setToGeometry(geom, None)
             self.rubberBandPoint.show()
-        else:
+        except:
             self.rubberBandPoint.hide()
 
     def layoutWidgets(self):
@@ -1171,9 +1275,11 @@ class ProfileFrame(QFrame):
         dSpace1 = self.profileArranging.vLines[1] - int(self.profileArranging.X_LABEL_WIDTH * 5 / 3)
         dSpace2 = self.profileArranging.vLines[1] - self.profileArranging.X_LABEL_WIDTH
         spaces = [dSpace1] + [dSpace2 for _ in range(len(self.profileArranging.vLines) - 3)] + [dSpace1]
+        maxSpace = 0
         for idx, dSpace in enumerate(spaces):
             xLayout.addSpacing(dSpace)
             xLayout.addWidget(self.xLabels[idx], 0, Qt.AlignLeft)
+            maxSpace += dSpace + self.xLabels[idx].size().width()
         xLayout.addStretch()
         xLayout.setSpacing(0)
         # V-Layout stacked widget and x-axis values layout
@@ -1182,6 +1288,11 @@ class ProfileFrame(QFrame):
         vLayout.addWidget(self.stackedWidget)
         vLayout.addLayout(xLayout)
         # H-Layout graph layouts
+        self.maxWidth = self.profileArranging.Y_LABEL_LEFT_INDENT + \
+                        self.profileArranging.Y_LABEL_RIGHT_INDENT + \
+                        max(self.stackedWidget.size().width(), maxSpace) + \
+                        self.profileArranging.Y_LABEL_WIDTH
+        print(f'layoutWidgets maxWidth = {self.maxWidth}')
         graphLayout.addSpacing(self.profileArranging.Y_LABEL_LEFT_INDENT)
         graphLayout.addLayout(yLayout)
         graphLayout.addSpacing(self.profileArranging.Y_LABEL_RIGHT_INDENT)
@@ -1198,7 +1309,7 @@ class ProfileFrame(QFrame):
         titles = self.profileArranging.sectTitles
         sortedTuples = sorted(self.profileArranging.browsedInfo.items(), key=lambda x: x[1])
         for it in sortedTuples:
-            if it[0] not in (names.xTooltip, names.yTooltip):
+            if it[0] not in (names.xTooltip, names.yTooltip, names.pointXY):
                 formLayout.addRow(f'{titles[it[0]]} : ', self.detailsLabels[it[0]])
         detailsCurrent.setLayout(formLayout)
         # Total info
@@ -1211,8 +1322,10 @@ class ProfileFrame(QFrame):
         splitter.addWidget(detailsTotal)
         splitter.addWidget(detailsCurrent)
         hLayout.addWidget(splitter, 0, Qt.AlignLeft)
+        print(f'layoutWidgets splitter width = {splitter.size().width()}')
         hLayout.addStretch()
         hLayout.setSpacing(0)
+        profileLayout.setContentsMargins(0, 0, 0, 0)
         profileLayout.addLayout(graphLayout)
         profileLayout.addLayout(hLayout)
         profileLayout.addStretch()
@@ -1239,7 +1352,7 @@ class ProfileFrame(QFrame):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self.isPaintingFinished:
+        if not self.isPaintingFinished and Qgis.QGIS_VERSION_INT < 32600:
             self.isPaintingFinished = True
             try:
                 QTimer.singleShot(
@@ -1250,14 +1363,18 @@ class ProfileFrame(QFrame):
                 self.setPositionsData()
             except:
                 pass
+        elif Qgis.QGIS_VERSION_INT >= 32600:
+            self.setPositionsData()
 
     def showProfileView(self):
         if not self.isStackedWidgetDestroyed:
             self.stackedWidget.setCurrentWidget(self.profileView)
+            # print(f'showProfileView profileView width = {self.profileView.size().width()}')
 
     def showPlaceholder(self):
         if not self.isStackedWidgetDestroyed:
             self.stackedWidget.setCurrentWidget(self.placeholder)
+            # print(f'showPlaceholder placeholder width = {self.placeholder.size().width()}')
 
     def changeLabelsColor(self, isHover):
         if isHover:
@@ -1282,17 +1399,17 @@ class ProfileFrame(QFrame):
         self.yLabelsLevel = self.profileView.geometry().topLeft().x() - yTooltip.geometry().width() - 1
         self.yTooltipPositions = [
             row + self.profileView.geometry().topLeft().y() - int(yTooltip.geometry().height() / 2)
-            for row in range(self.profileView.model().rowCount())
+            for row in range(self.profileArranging.FIG_HEIGHT)
         ]
-        rightColumnLimit = self.profileView.model().columnCount() - \
+        rightColumnLimit = self.profileArranging.FIG_WIDTH - \
                            int(xTooltip.geometry().width() / 2)
-        rightLimit = self.profileView.geometry().topLeft().x() + self.profileView.model().columnCount() - \
+        rightLimit = self.profileView.geometry().topLeft().x() + self.profileArranging.FIG_WIDTH - \
                      xTooltip.geometry().width()
         self.xTooltipPositions = [
             (column + self.profileView.geometry().topLeft().x() - \
              int(xTooltip.geometry().width() / 2)
              ) if column < rightColumnLimit else rightLimit
-            for column in range(self.profileView.model().columnCount())
+            for column in range(self.profileArranging.FIG_WIDTH)
         ]
 
     def hideTooltips(self):
@@ -1302,8 +1419,7 @@ class ProfileFrame(QFrame):
         self.detailsLabels[self.profileArranging.sectNames.yTooltip].hide()
 
     def updateView(self):
-        self.profileView.resizeColumnsToContents()
-        self.profileView.resizeRowsToContents()
+        self.profileView.updateView()
 
 
 class ProfileRubberBandLine(QgsRubberBand):
@@ -1339,45 +1455,6 @@ class ProfileRubberBandLine(QgsRubberBand):
         topLayer.setPenCapStyle(Qt.PenCapStyle.FlatCap)
         symbol.appendSymbolLayer(topLayer)
         self.setSymbol(symbol)
-        self._lineString = None
-        self.vertices = None
-        self.distanceArea = None
-
-    def setToGeometry(self, geometry, distanceArea):
-        if geometry.isEmpty():
-            return False
-        self.vertices = geometry.asPolyline()
-        if len(self.vertices) < 2:
-            self.vertices = None
-            return False
-        self.distanceArea = distanceArea
-        super().setToGeometry(geometry, None)
-        if Qgis.QGIS_VERSION_INT >= 34000:
-            self._lineString = QgsLineString(self.vertices)
-        return True
-
-    def getPointVersusDistance(self, distance):
-        if self._lineString is not None:
-            return self._lineString.interpolatePoint(distance)
-        if self.vertices is None:
-            return QgsGeometry()
-        count = 0.0
-        for i in range(1, len(self.vertices)):
-            p1 = self.vertices[i - 1]
-            p2 = self.vertices[i]
-            segmentLength = self.distanceArea.measureLine(
-                QgsPointXY(p1),
-                QgsPointXY(p2)
-            )
-            if count + segmentLength >= distance:
-                # Line interpolation
-                t = (distance - count) / segmentLength
-                x = p1.x() + t * (p2.x() - p1.x())
-                y = p1.y() + t * (p2.y() - p1.y())
-                return QgsPoint(x, y)
-            count += segmentLength
-        # If the distance is more than line length then return the last point
-        return QgsPoint(self.vertices[-1])
 
 
 class ProfileRubberBandPoint(QgsRubberBand):
@@ -1396,7 +1473,7 @@ class Odometer(QObject):
     def __init__(self, odometer=None, parent=None):
         super().__init__(parent)
         if (
-            isinstance(odometer, list) and
+                isinstance(odometer, list) and
                 len(odometer) > 1 and
                 all(isinstance(value, (int, float)) for value in odometer) and
                 all(odometer[i] <= odometer[i + 1] for i in range(len(odometer) - 1))
@@ -1411,7 +1488,7 @@ class Odometer(QObject):
 
     def setOdometer(self, odometer):
         if (
-            isinstance(odometer, list) and
+                isinstance(odometer, list) and
                 len(odometer) > 1 and
                 all(isinstance(value, (int, float)) for value in odometer) and
                 all(odometer[i] <= odometer[i + 1] for i in range(len(odometer) - 1))
@@ -1432,4 +1509,3 @@ class Odometer(QObject):
 
     def distance(self):
         return self._distance
-
