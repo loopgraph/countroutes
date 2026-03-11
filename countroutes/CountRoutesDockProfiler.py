@@ -1,12 +1,15 @@
-from qgis.PyQt.QtCore import Qt, QPointF, QRectF, QObject, QEvent, QTimer, QSize, QFileInfo, QDir, QRect
+from qgis.PyQt.QtCore import (Qt, QPointF, QRectF, QObject, QEvent, QTimer, QSize, QFileInfo, QDir, QRect,
+                              pyqtSignal)
 from qgis.PyQt.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QBrush,
                              QFont, QPolygonF, QFontMetrics, QPainterPath, QPolygonF, QIcon)
 from qgis.PyQt.QtWidgets import (QWidget, QAction, QGraphicsPixmapItem, QGraphicsLineItem,
                                  QGraphicsSimpleTextItem, QApplication, QToolBar, QMenu,
                                  QVBoxLayout, QFileDialog, QMessageBox, QToolButton, QDialog,
-                                 QDialogButtonBox, QListWidgetItem, QListWidget)
+                                 QDialogButtonBox, QListWidgetItem, QListWidget,
+                                 QFrame, QHBoxLayout, QLabel)
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, UnivariateSpline, interp1d
+from scipy.signal import savgol_filter
 from qgis.gui import (QgsPlotCanvas, QgsDockWidget, QgsRubberBand,
                       QgsMapLayerComboBox)
 from qgis.core import (QgsApplication, QgsSettings, QgsVectorLayer, QgsCoordinateReferenceSystem,
@@ -19,6 +22,7 @@ from qgis import processing
 from collections import namedtuple
 import traceback
 import os
+import math
 
 pluginPath = os.path.split(os.path.dirname(__file__))[0]
 
@@ -29,9 +33,13 @@ class Typography:
     labelFormatX: str = "{:.2f}"
     labelFormatY: str = "{: .1f}"
     gridTextFormatX: str = "{:.2f}"
-    maxTextX: str = "000000"
+    maxTextX: str = "100000.00 m"
     gridTextFormatY: str = "{:.1f}"
-    maxTextY: str = "000000"
+    maxTextY: str = "9000.00 m"
+    maxTextG: str = "-00.00 °"
+    distanceTextFormatInfo: str = "{: 6.2f} m"
+    elevationTextFormatInfo: str = "{: 7.2f} m"
+    gradientTextFormatInfo: str = "{: 2.2f} °"
     minDataPixWidth: int = 20
     minDataPixHeight: int = 10
     plotPointsShare: float = 0.4     # Points share of the total x-pixels for graph plotting (< 1)
@@ -41,7 +49,49 @@ class Typography:
     axisColor: QColor = field(default_factory=lambda: QColor(120, 120, 120))
     gridTextColor: QColor = field(default_factory=lambda: QColor(120, 120, 120))
     curveColor: QColor = field(default_factory=lambda: QColor(0, 100, 200))
+    style1: str = """
+        QFrame#DataPanel {
+            background-color: rgba(45, 45, 45, 230);
+            border-radius: 10px;
+            padding: 10px;
+        }
+        QLabel {
+            color: #ffffff;
+            font-family: "Segoe UI", sans-serif;
+        }
+        QLabel#Value {
+            font-size: 16px;
+            font-weight: bold;
+            color: #00d1b2; /* Accent turquoise */
+        }
+        QLabel#Title {
+            font-size: 10px;
+            text-transform: uppercase;
+            color: #aaaaaa;
+        }
+    """
+    style2: str = """
+        QFrame#DataPanel {
+            background-color: #ffffff;
+            border-top: 1px solid #e0e0e0; /* A thin line of separation from the graph */
+            padding: 5px;
+        }
+        QLabel#Title {
+            font-size: 11px;
+            font-weight: 600;
+            color: #888888; /* Muted gray */
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        QLabel#Value {
+            font-family: 'Consolas', 'Monospace';
+            font-size: 18px; 
+            min-height: 22px;
+            color: #2c3e50; /* Deep dark blue/gray */
+        }
+    """
     labelFont: QFont = field(init=False)
+    infoFont: QFont = field(init=False)
     scalesFont: QFont = field(init=False)
     yTextWidth: int = field(init=False)
     labelHeight: int = field(init=False)
@@ -53,6 +103,10 @@ class Typography:
         # Font settings for coordinate labels
         self.labelFont = QFont("Segoe UI", 9)
         self.labelFont.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+        self.infoFont = QFont()
+        self.infoFont.setFamily("Consolas")
+        self.infoFont.setStyleHint(QFont.Monospace)
+        self.infoFont.setPixelSize(18)
         self.scalesFont = QFont("Segoe UI", 8)
         self.scalesFont.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
         self.yTextWidth = int(QFontMetrics(self.labelFont).horizontalAdvance(self.maxTextY))
@@ -78,6 +132,8 @@ class SmartProfile:
         self.maxX = 100
         self.minY = 0
         self.maxY = 100
+        self.windowLength = 7
+        self.polyorder = 2
 
     def makeData(self, geometryZ):
         # Creating a copy of geometry to remove duplicate nodes
@@ -112,9 +168,25 @@ class SmartProfile:
         self.maxX = self.x.max()
         self.minY = self.y.min()
         self.maxY = self.y.max()
+        # The smoothing spline is best suited after preliminary preparation
+        # 1. Resampling (filling the holes linearly to create a continuous base)
+        self.x = np.linspace(self.minX, self.maxX, num=len(self.x))  # Uniform grid
+        linearFunc = interp1d(self.x, self.y, kind='linear', fill_value="extrapolate")
+        self.y = linearFunc(self.x)
+        # NB!!! The GPS track has time gaps and random altitude excursions.
+        # A regular CubicSpline can turn the excursions or DIM-steps into unnatural waves.
         # Creating a cubic spline
         # bc_type='natural' gives smoothness at the edges
-        self.spline = CubicSpline(self.x, self.y, bc_type='natural')
+        # self.spline = CubicSpline(self.x, self.y, bc_type='natural')
+        # 2. Removing the "saw" effect, but may leave small "waves" or
+        # artifacts at the joints of the filter windows.
+        self.y = savgol_filter(self.y, self.windowLength, self.polyorder)
+        # UnivariateSpline with parameter s > 0 acts as a second level of control, finally aligning the track
+        # Using UnivariateSpline instead of CubicSpline
+        # to get spline(x) as a smooth curve without noise and steps.
+        # s is the smoothing coefficient. It is selected experimentally.
+        # If s=0, it will turn into a regular CubicSpline.
+        self.spline = UnivariateSpline(self.x, self.y, s=len(self.x) * 0.5)
         # Precalculating the derivative (gradient) as a new spline
         self.derivativeSpline = self.spline.derivative()
         return True
@@ -123,7 +195,8 @@ class SmartProfile:
         # Instantly getting height and gradient (O(log N))
         # Splines in scipy are optimized for fast search of the required segment
         h = float(self.spline(currentX))
-        grad = float(self.derivativeSpline(currentX))
+        # grad = math.radians(float(self.derivativeSpline(currentX)))
+        grad = np.degrees(np.arctan(float(self.derivativeSpline(currentX))))
         return h, grad
 
     def getPainterPath(
@@ -194,14 +267,15 @@ class SmartProfile:
         if not any(it.x() - indent.left < 0 or it.x() - indent.left > xWidth or
                    it.y() - indent.top < 0 or it.y() - indent.top > dataViewSize.height() for it in points):
             path.addPolygon(QPolygonF(points))
-            print('Polygon added')
         return path
 
 
-class PlotInteraction:
+class PlotInteraction(QObject):
     # Managing native C++ scene elements (without overriding Python paint)
+    showInfoDisplayData = pyqtSignal(object)
 
     def __init__(self, canvas, smartProfile):
+        super().__init__()
         self.canvas = canvas
         self.scene = canvas.scene()
         self.typo = Typography()
@@ -213,7 +287,11 @@ class PlotInteraction:
         self.gsd = None     # Ground Sample Distance
         self.xRealOffset = None
         self.yRealOffset = None
-
+        self.infoDisplayData = {
+            'distance': '',
+            'elevation': '',
+            'gradient': ''
+        }
         # 1) Background (curve and grid)
         self.background = QGraphicsPixmapItem()
         # It's important for High DPI: switch off smoothing when scaling this item
@@ -266,8 +344,8 @@ class PlotInteraction:
             return
         y = scenePos.y()
         hideOnlyY = False
+        realY, grad = self.smartProfile.getData(realX)
         if self.snapping:
-            realY, _ = self.smartProfile.getData(realX)
             if self.isAxisRatioLocked:
                 # y = int((viewRect.bottom() - realY) / self.gsd)     # snapped & locked
                 y = int(dataViewSize.height() / 2 - (realY - viewRect.top()) / self.gsd) + \
@@ -310,8 +388,17 @@ class PlotInteraction:
         else:
             self.labelY.setPos(sRect.left() + offset - 1, y - yTextHeight - 2 * offset)
 
+        distInfo, elevInfo, gradInfo = (
+            self.typo.distanceTextFormatInfo.format(realX),
+            self.typo.elevationTextFormatInfo.format(realY),
+            self.typo.gradientTextFormatInfo.format(grad)
+        )
+
         if hideOnlyY:
             self.hideCursor(hideOnlyY)
+            self.infoDisplayData['distance'] = distInfo
+            self.infoDisplayData['elevation'] = ''
+            self.infoDisplayData['gradient'] = gradInfo
         else:
             if not self.vLine.isVisible():
                 for i in [self.vLine, self.labelX]:
@@ -319,6 +406,11 @@ class PlotInteraction:
             if not self.hLine.isVisible():
                 for i in [self.hLine, self.labelY]:
                     i.setVisible(True)
+            self.infoDisplayData['distance'] = distInfo
+            self.infoDisplayData['elevation'] = elevInfo
+            self.infoDisplayData['gradient'] = gradInfo
+            self.showInfoDisplayData.emit(self.infoDisplayData)
+        self.showInfoDisplayData.emit(self.infoDisplayData)
         # self.canvas.viewport().update()
 
     def hideCursor(self, hideOnlyY=False):
@@ -331,6 +423,10 @@ class PlotInteraction:
         else:
             for item in [self.vLine, self.hLine, self.labelX, self.labelY]:
                 item.setVisible(False)
+            self.infoDisplayData['distance'] = ''
+            self.infoDisplayData['elevation'] = ''
+            self.infoDisplayData['gradient'] = ''
+            self.showInfoDisplayData.emit(self.infoDisplayData)
 
 
 class CanvasFilter(QObject):
@@ -412,7 +508,8 @@ class MyPlotDock(QgsDockWidget):
         super().__init__("Profile (not selected)")
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.canvas = QgsPlotCanvas()
-        # self.setWidget(self.canvas)
+        self.smartProfile = SmartProfile()
+        self.plotUI = PlotInteraction(self.canvas, self.smartProfile)
         widgetContainer = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -485,6 +582,9 @@ class MyPlotDock(QgsDockWidget):
         toolBar.addAction(self.actionShowTracing)
         layout.addWidget(toolBar)
         layout.addWidget(self.canvas)
+        self.infoDisplay = InfoDisplay(self.plotUI.typo)
+        self.plotUI.showInfoDisplayData.connect(self.infoDisplay.updateData)
+        layout.addWidget(self.infoDisplay)
         layout.addStretch()
         layout.setSpacing(0)
         widgetContainer.setLayout(layout)
@@ -496,10 +596,9 @@ class MyPlotDock(QgsDockWidget):
             QFileInfo(QDir.homePath()).absoluteFilePath(),
             QgsSettings.Plugins
         )
-        # Initialization
-        self.smartProfile = SmartProfile()
         self.cachedPath = None
-        self.plotUI = PlotInteraction(self.canvas, self.smartProfile)
+
+        # Event filter initialization
         self.eventFilter = CanvasFilter(self)
         self.canvas.viewport().installEventFilter(self.eventFilter)
 
@@ -561,7 +660,6 @@ class MyPlotDock(QgsDockWidget):
             return
         # w, h = self.viewRect.width() * scale, self.viewRect.height() * scale
         w = self.viewRect.width() * scale
-        print(f'scale = {scale}, w = {w}')
         if w >= self.smartProfile.maxX - self.smartProfile.minX:
             self.zoomFull()
             return
@@ -573,19 +671,16 @@ class MyPlotDock(QgsDockWidget):
             x0 = realX - w / 2
         # c = self.viewRect.center()
         self.actionZoomFull.setEnabled(True)
-        print(f'Old viewRect = {self.viewRect}')
         self.viewRect = QRectF(
             x0,
             self.smartProfile.minY,
             w,
             self.smartProfile.maxY - self.smartProfile.minY
         )
-        print(f' rendering new vieRect = {self.viewRect}')
         self.renderBackground()
 
     def zoomFull(self):
         if self.smartProfile.x is None:
-            print('smartProfile.x is None !!!')
             return
         self.viewRect = QRectF(
             self.smartProfile.minX,
@@ -593,7 +688,6 @@ class MyPlotDock(QgsDockWidget):
             self.smartProfile.maxX - self.smartProfile.minX,
             self.smartProfile.maxY - self.smartProfile.minY
         )
-        print(f'zoomFull viewRect = {self.viewRect}')
         # r = self.viewRect
         # print(f'viewRect.left = {self.plotUI.typo.labelFormatX.format(r.left())}')
         # print(f'viewRect.top = {self.plotUI.typo.labelFormatY.format(r.top())}')
@@ -606,7 +700,6 @@ class MyPlotDock(QgsDockWidget):
         if self.smartProfile.x is None:
             return False
         deltaX = (newMousePos.x() - oldMosePos.x()) * self.plotUI.gsd
-        print(f'deltaX = {deltaX}')
         x0 = self.viewRect.left()
         x1 = self.viewRect.right()
         if x0 > self.smartProfile.minX and deltaX > 0:
@@ -743,40 +836,11 @@ class MyPlotDock(QgsDockWidget):
                 self.cachedPath = path
                 p.drawPath(self.cachedPath)
             elif self.cachedPath and not self.cachedPath.isEmpty():
-                print('path is empty!!!')
                 p.drawPath(self.cachedPath)
         p.end()
         # Update the background and synchronize the scene size
         self.plotUI.updateBackground(QPixmap.fromImage(buffer))
         self.canvas.scene().setSceneRect(QRectF(0, 0, vSize.width(), vSize.height()))
-
-    """
-        # Dynamic legend
-        # Combining legend text based on variables
-        fullLegendText = f"{self.seriesName} ({self.unitName})"
-
-        # Calculating the text width so that the legend frame adjusts
-        p.setFont(QFont("Segoe UI", 9))
-        textWidth = p.fontMetrics().horizontalAdvance(fullLegendText)
-        legendW = textWidth + 60  # Reserve for sample line and indents
-
-        legendRect = QRectF(vSize.width() - legendW - 15, 40, legendW, 35)
-
-        # Drawing the legend background
-        p.setBrush(QColor(255, 255, 255, 230))
-        p.setPen(QPen(QColor(180, 180, 180), 1))
-        p.drawRoundedRect(legendRect, 4, 4)
-
-        # Line symbol of the legend (matches the color of the graph)
-        p.setPen(QPen(QColor(0, 100, 200), 2))
-        lineY = legendRect.center().y()
-        p.drawLine(int(legendRect.left() + 10), int(lineY),
-                   int(legendRect.left() + 30), int(lineY))
-
-        # Drawing combined legend text
-        p.setPen(Qt.black)
-        p.drawText(int(legendRect.left() + 40), int(lineY + 5), fullLegendText)
-        """
         # except:
         #     ex = "{0}".format(traceback.format_exc())
         #     msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
@@ -913,6 +977,75 @@ class LayerSelectDialog(QDialog):
             layerId = items[0].data(Qt.UserRole)
             return QgsProject.instance().mapLayer(layerId)
         return None
+
+
+class InfoDisplay(QFrame):
+    def __init__(self, typo):
+        super().__init__()
+        self.typo = typo
+        self.setObjectName("DataPanel")
+        self.setStyleSheet(self.typo.style2)
+        layout = QHBoxLayout(self)
+
+        layout.addStretch()
+        self.distLabel = self._addBlock(
+            layout,
+            "Расстояние",
+            "",
+            self.typo.maxTextX
+        )
+        self.elevLabel = self._addBlock(
+            layout,
+            "Высота",
+            "",
+            self.typo.maxTextY
+        )
+        self.gradLabel = self._addBlock(
+            layout,
+            "Градиент",
+            "",
+            self.typo.maxTextG
+        )
+        layout.addStretch()
+
+    def _addBlock(self, parentLayout, title, initialValue, textSample):
+        container = QFrame()
+        container.setFixedWidth(self.getOptimalWidth(self.typo.infoFont, textSample))
+        block = QVBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+
+        tLbl = QLabel(title)
+        tLbl.setObjectName("Title")
+        tLbl.setAlignment(Qt.AlignCenter)  # Центрируем текст
+
+        vLbl = QLabel(initialValue)
+        vLbl.setObjectName("Value")
+        vLbl.setAlignment(Qt.AlignCenter)  # Центрируем значение
+
+        block.addWidget(tLbl)
+        block.addWidget(vLbl)
+        # block = QVBoxLayout()
+        # t_lbl = QLabel(title)
+        # t_lbl.setObjectName("Title")
+        # v_lbl = QLabel(initial_value)
+        # v_lbl.setObjectName("Value")
+        # block.addWidget(t_lbl)
+        # block.addWidget(v_lbl)
+        parentLayout.addWidget(container, stretch=1)
+        return vLbl
+
+    def getOptimalWidth(self, font, sampleText):
+        fm = QFontMetrics(font)
+        return fm.horizontalAdvance(sampleText) + 5
+
+    def updateData(self, data):
+        try:
+            self.distLabel.setText(data['distance'])
+            self.elevLabel.setText(data['elevation'])
+            self.gradLabel.setText(data['gradient'])
+        except:
+            pass
 
 
 class ProfileRubberBandLine(QgsRubberBand):
