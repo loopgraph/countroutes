@@ -2,11 +2,11 @@ from qgis.PyQt.QtCore import (Qt, QPointF, QRectF, QObject, QEvent, QTimer, QSiz
                               pyqtSignal)
 from qgis.PyQt.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QBrush,
                              QFont, QPolygonF, QFontMetrics, QPainterPath, QPolygonF, QIcon)
-from qgis.PyQt.QtWidgets import (QWidget, QAction, QGraphicsPixmapItem, QGraphicsLineItem,
+from qgis.PyQt.QtWidgets import (QWidget, QAction, QActionGroup, QGraphicsPixmapItem, QGraphicsLineItem,
                                  QGraphicsSimpleTextItem, QApplication, QToolBar, QMenu,
                                  QVBoxLayout, QFileDialog, QMessageBox, QToolButton, QDialog,
-                                 QDialogButtonBox, QListWidgetItem, QListWidget,
-                                 QFrame, QHBoxLayout, QLabel)
+                                 QDialogButtonBox, QListWidgetItem, QListWidget, QGroupBox, QRadioButton,
+                                 QFrame, QHBoxLayout, QLabel, QDoubleSpinBox, QLineEdit, QButtonGroup)
 import numpy as np
 from scipy.interpolate import CubicSpline, UnivariateSpline, interp1d
 from scipy.signal import savgol_filter
@@ -22,6 +22,7 @@ from qgis import processing
 from collections import namedtuple
 import traceback
 import os
+import random
 import math
 
 pluginPath = os.path.split(os.path.dirname(__file__))[0]
@@ -29,7 +30,7 @@ pluginPath = os.path.split(os.path.dirname(__file__))[0]
 
 @dataclass
 class Typography:
-    offset: int = 5    # Text offset from cursor lines
+    offset: int = 5  # Text offset from cursor lines
     labelFormatX: str = "{:.2f}"
     labelFormatY: str = "{: .1f}"
     gridTextFormatX: str = "{:.2f}"
@@ -37,12 +38,20 @@ class Typography:
     gridTextFormatY: str = "{:.1f}"
     maxTextY: str = "9000.00 m"
     maxTextG: str = "-00.00 °"
+    maxTextE: str = "10000000.00 kcal"
+    maxTextC: str = "2400.00 kcal"
+    maxTextF: str = "1000.00 ml"
+    maxTextS: str = "10.00 km/h"
     distanceTextFormatInfo: str = "{: 6.2f} m"
     elevationTextFormatInfo: str = "{: 7.2f} m"
     gradientTextFormatInfo: str = "{: 2.2f} °"
+    energyTextFormatInfo: str = "{: 8.2f} kcal"
+    glycogenTextFormatInfo: str = "{: 4.2f} kcal"
+    fluidTextFormatInfo: str = "{: 4.2f} ml"
+    speedTextFormatInfo: str = "{: 2.2f} km/h"
     minDataPixWidth: int = 20
     minDataPixHeight: int = 10
-    plotPointsShare: float = 0.4     # Points share of the total x-pixels for graph plotting (< 1)
+    plotPointsShare: float = 0.4  # Points share of the total x-pixels for graph plotting (< 1)
     cursorColor: QColor = field(default_factory=lambda: QColor(255, 50, 50, 200))
     labelColor: QColor = field(default_factory=lambda: QColor(150, 0, 0))
     gridColor: QColor = field(default_factory=lambda: QColor(235, 235, 235))
@@ -112,7 +121,7 @@ class Typography:
         self.yTextWidth = int(QFontMetrics(self.labelFont).horizontalAdvance(self.maxTextY))
         self.labelHeight = int(QFontMetrics(self.labelFont).ascent())
         self.gridTextHeight = int(QFontMetrics(self.scalesFont).ascent())
-        self.xGridCounts = [1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5, 6]     # Vertical grid count depends on data rect width
+        self.xGridCounts = [1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5, 6]  # Vertical grid count depends on data rect width
         self.indent = namedtuple("INDENTS", ['left', 'top', 'right', 'bottom'])(
             # Edges with 1px
             1 + self.yTextWidth + 1 + 1,  # With Y-axis 1px
@@ -123,19 +132,35 @@ class Typography:
 
 
 class SmartProfile:
-    def __init__(self):
+    def __init__(self, mbModule):
         self.x = None
         self.y = None
         self.spline = None
         self.derivativeSpline = None
+        self.energySpline = None
+        self.glycogenLevelSpline = None
+        self.fluidLossSpline = None
+        self.speedSpline = None
+        self.rechargesPlan = None
         self.minX = 0
         self.maxX = 100
         self.minY = 0
         self.maxY = 100
-        self.windowLength = 7
-        self.polyorder = 2
+        self.minE = self.maxE = 0   # Elevations range
+        self.minG = self.maxG = 0   # Gradient range
+        self.minS = self.maxS = 0   # Speed range
+        self.minC = self.maxC = 0   # Glycogen range
+        self.minF = self.maxF = 0   # Fluid range
+        self.mbModule = mbModule
+        self.totalCalories = 0.0
 
-    def makeData(self, geometryZ):
+    def makeData(self, geometryZ, bodyMetric):
+        """
+        The method gets data (x, y, z) from geometryZ and
+        creates data sets (splines) for charts
+        :param geometryZ: input spatial data
+        :return: a set of splines
+        """
         # Creating a copy of geometry to remove duplicate nodes
         lineString = geometryZ.get()
         lineString.removeDuplicateNodes()
@@ -149,6 +174,8 @@ class SmartProfile:
         # The distance of the profile route
         totalLength = da.measureLength(geom2D)  # In meters!!!
         print(f'totalLength = {totalLength}')
+        # self.minX = 0.0
+        # self.maxX = totalLength
         if totalLength == 0.0:
             return False
         # Preparing coordinates
@@ -162,33 +189,65 @@ class SmartProfile:
             )
             xList.append(dist)
             yList.append(lineString.zAt(i))
-        self.x = np.array(xList)
-        self.y = np.array(yList)
-        self.minX = self.x.min()
-        self.maxX = self.x.max()
-        self.minY = self.y.min()
-        self.maxY = self.y.max()
-        # The smoothing spline is best suited after preliminary preparation
-        # 1. Resampling (filling the holes linearly to create a continuous base)
-        self.x = np.linspace(self.minX, self.maxX, num=len(self.x))  # Uniform grid
-        linearFunc = interp1d(self.x, self.y, kind='linear', fill_value="extrapolate")
-        self.y = linearFunc(self.x)
-        # NB!!! The GPS track has time gaps and random altitude excursions.
-        # A regular CubicSpline can turn the excursions or DIM-steps into unnatural waves.
-        # Creating a cubic spline
-        # bc_type='natural' gives smoothness at the edges
-        # self.spline = CubicSpline(self.x, self.y, bc_type='natural')
-        # 2. Removing the "saw" effect, but may leave small "waves" or
-        # artifacts at the joints of the filter windows.
-        self.y = savgol_filter(self.y, self.windowLength, self.polyorder)
-        # UnivariateSpline with parameter s > 0 acts as a second level of control, finally aligning the track
-        # Using UnivariateSpline instead of CubicSpline
-        # to get spline(x) as a smooth curve without noise and steps.
-        # s is the smoothing coefficient. It is selected experimentally.
-        # If s=0, it will turn into a regular CubicSpline.
-        self.spline = UnivariateSpline(self.x, self.y, s=len(self.x) * 0.5)
-        # Precalculating the derivative (gradient) as a new spline
-        self.derivativeSpline = self.spline.derivative()
+        xRaw = np.array(xList)
+        yRaw = np.array(yList)
+
+        (
+            self.x,
+            self.minX,
+            self.maxX,
+            self.spline,
+            self.minE,
+            self.maxE,
+            self.derivativeSpline,
+            self.minG,
+            self.maxG,
+            rmse,
+            gainError
+        ) = self.mbModule.prepareElevationData(xRaw, yRaw, mode='route')
+        self.minY = self.minE
+        self.maxY = self.maxE
+        print(f'minX = {self.minX}, max = {self.maxX}')
+        print(f'minY = {self.minY}, maxY = {self.maxY}')
+        miG = np.degrees(np.arctan(float(self.minG)))
+        maG = np.degrees(np.arctan(float(self.maxG)))
+        print(f'minG = {"{: 2.2f} °".format(miG)}, maxG = {"{: 2.2f} °".format(maG)}')
+        print(f'----- RMSE = {rmse}, Gain Error = {gainError}')
+        # a) Если RMSE > 2-3 метров: Ваш GPX-трек очень шумный (плохой сигнал в лесу или ущелье).
+        #     Набору высоты верить нельзя, его нужно делить на 1.5–2.
+        # b) Если RMSE < 0.5 метров: Данные из QGIS (DEM) или качественного барометра.
+        #     Набор высоты будет максимально точным.
+
+        (
+            self.totalCalories,
+            self.energySpline,
+            self.glycogenLevelSpline,
+            self.minC,
+            self.maxC,
+            self.fluidLossSpline,
+            self.minF,
+            self.maxF,
+            self.speedSpline,
+            self.minS,
+            self.maxS,
+            self.rechargesPlan
+        ) = self.mbModule.prepareEnergyData(
+                self.x,
+                self.spline,
+                self.derivativeSpline,
+                bodyMetric['weight'],
+                bodyMetric['height'],
+                bodyMetric['age'],
+                bodyMetric['gender'] == 'm',
+                bodyMetric['speed'],
+                None,
+                None,
+                None,
+                massPack=bodyMetric['cargo'],
+                isOptimizedSpeed=False
+            )
+        print(f'Total calories = {self.totalCalories} kcal')
+
         return True
 
     def getData(self, currentX):
@@ -197,14 +256,15 @@ class SmartProfile:
         h = float(self.spline(currentX))
         # grad = math.radians(float(self.derivativeSpline(currentX)))
         grad = np.degrees(np.arctan(float(self.derivativeSpline(currentX))))
-        return h, grad
+        energy = float(self.energySpline(currentX))
+        return h, grad, energy
 
     def getPainterPath(
             self,
-            viewRect,   # The rectangle with coordinates (minX, minY) (maxX, maxY)
-            indent,     # Indents between canvas edges and the graph array
-            dataViewSize,   # The size of the graph array
-            plotPointsShare,    # The share of chart reference points
+            viewRect,  # The rectangle with coordinates (minX, minY) (maxX, maxY)
+            indent,  # Indents between canvas edges and the graph array
+            dataViewSize,  # The size of the graph array
+            plotPointsShare,  # The share of chart reference points
             isAxisRatioLocked=True
     ):
         # Generates a path for QPainter.
@@ -244,7 +304,7 @@ class SmartProfile:
         def toPxAxisLockXBased(pX, pY):
             px = ((pX - viewRect.left()) / viewRect.width()) * xWidth
             py = dataViewSize.height() / 2 - (pY - viewRect.top()) * \
-                (xWidth / viewRect.width())
+                 (xWidth / viewRect.width())
             """
             y = int(dataViewSize.height() / 2 - (realY - viewRect.top()) / self.gsd) + \
                     self.typo.indent.top
@@ -254,7 +314,7 @@ class SmartProfile:
         def toPxAxisLockYBased(pX, pY):
             px = ((pX - viewRect.left()) / viewRect.width()) * xWidth
             py = dataViewSize.height() / 2 - (pY - viewRect.top()) * \
-                (xWidth / viewRect.width())
+                 (xWidth / viewRect.width())
             return QPointF(px + indent.left, py + indent.top)
 
         if isAxisRatioLocked:
@@ -284,13 +344,14 @@ class PlotInteraction(QObject):
         # the distance and elevation axis scales are locked to each other
         self.isAxisRatioLocked = True
         self.isXBased = True
-        self.gsd = None     # Ground Sample Distance
+        self.gsd = None  # Ground Sample Distance
         self.xRealOffset = None
         self.yRealOffset = None
         self.infoDisplayData = {
             'distance': '',
             'elevation': '',
-            'gradient': ''
+            'gradient': '',
+            'energy': ''
         }
         # 1) Background (curve and grid)
         self.background = QGraphicsPixmapItem()
@@ -344,7 +405,7 @@ class PlotInteraction(QObject):
             return
         y = scenePos.y()
         hideOnlyY = False
-        realY, grad = self.smartProfile.getData(realX)
+        realY, grad, energy = self.smartProfile.getData(realX)
         if self.snapping:
             if self.isAxisRatioLocked:
                 # y = int((viewRect.bottom() - realY) / self.gsd)     # snapped & locked
@@ -352,12 +413,12 @@ class PlotInteraction(QObject):
                     self.typo.indent.top
             else:
                 y = int(((viewRect.bottom() - realY) / viewRect.height()) * dataViewSize.height()) \
-                    + indent.top + 1    # snapped & unlocked
+                    + indent.top + 1  # snapped & unlocked
             if y < 0:
                 hideOnlyY = True
         else:  # Unsnapped
             if self.isAxisRatioLocked:
-                realY = self.yRealOffset - y * self.gsd     # unsnapped & locked
+                realY = self.yRealOffset - y * self.gsd  # unsnapped & locked
             else:
                 realY = (dataViewSize.height() + indent.top + 1 - y) * \
                         viewRect.height() + viewRect.top()  # unsnapped & unlocked
@@ -388,17 +449,19 @@ class PlotInteraction(QObject):
         else:
             self.labelY.setPos(sRect.left() + offset - 1, y - yTextHeight - 2 * offset)
 
-        distInfo, elevInfo, gradInfo = (
+        distInfo, elevInfo, gradInfo, energyInfo = (
             self.typo.distanceTextFormatInfo.format(realX),
             self.typo.elevationTextFormatInfo.format(realY),
-            self.typo.gradientTextFormatInfo.format(grad)
+            self.typo.gradientTextFormatInfo.format(grad),
+            self.typo.energyTextFormatInfo.format(energy)
         )
-
+        # print(f'gradInfo = {gradInfo}, energyInfo = {energyInfo}')
         if hideOnlyY:
             self.hideCursor(hideOnlyY)
             self.infoDisplayData['distance'] = distInfo
             self.infoDisplayData['elevation'] = ''
             self.infoDisplayData['gradient'] = gradInfo
+            self.infoDisplayData['energy'] = energyInfo
         else:
             if not self.vLine.isVisible():
                 for i in [self.vLine, self.labelX]:
@@ -409,7 +472,7 @@ class PlotInteraction(QObject):
             self.infoDisplayData['distance'] = distInfo
             self.infoDisplayData['elevation'] = elevInfo
             self.infoDisplayData['gradient'] = gradInfo
-            self.showInfoDisplayData.emit(self.infoDisplayData)
+            self.infoDisplayData['energy'] = energyInfo
         self.showInfoDisplayData.emit(self.infoDisplayData)
         # self.canvas.viewport().update()
 
@@ -426,6 +489,7 @@ class PlotInteraction(QObject):
             self.infoDisplayData['distance'] = ''
             self.infoDisplayData['elevation'] = ''
             self.infoDisplayData['gradient'] = ''
+            self.infoDisplayData['energy'] = ''
             self.showInfoDisplayData.emit(self.infoDisplayData)
 
 
@@ -503,16 +567,55 @@ class CanvasFilter(QObject):
         return False
 
 
+
+
+
 class MyPlotDock(QgsDockWidget):
-    def __init__(self, iface):
+    def __init__(self, iface, mbModule):
         super().__init__("Profile (not selected)")
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.canvas = QgsPlotCanvas()
-        self.smartProfile = SmartProfile()
+        self.smartProfile = SmartProfile(mbModule)
         self.plotUI = PlotInteraction(self.canvas, self.smartProfile)
+        self.settings = QgsSettings()
+
+        self.travelerLimits = {
+            'age': mbModule.AGE_LIMIT,
+            'weight': mbModule.WEIGHT_LIMIT,
+            'height': mbModule.HEIGHT_LIMIT,
+            'speed': (
+                (int((mbModule.SPEED_LIMIT[0] * 3.6) * 100)) / 100,
+                int((mbModule.SPEED_LIMIT[1] * 3.6) * 100) / 100
+            ),
+            'cargo': mbModule.PACK_LIMIT
+        }
+        self.travelerListKey = 'Plugins/countRoutesTravelerList'
+        self.travelerDefaultId = 0
+        defaultTraveler = {
+            self.travelerDefaultId: {
+                "name": 'NoName (default)',
+                "gender": False,    # Male - False
+                "age": int(40),
+                "weight": float(80),
+                "height": int(180),
+                "speed": float(5),
+                "cargo": float(0)
+            }
+        }
+        self.travelerDic = self.settings.value(
+            self.travelerListKey,
+            defaultTraveler
+        )
+        self.lastActiveTravelerKey = 'Plugins/countRoutesLastActiveTraveler'
+        self.lastActiveTraveler = self.settings.value(
+            self.lastActiveTravelerKey,
+            self.travelerDefaultId
+        )
+
         widgetContainer = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         toolBar = QToolBar(widgetContainer)
         toolBar.setIconSize(iface.iconSize(True))
 
@@ -522,15 +625,61 @@ class MyPlotDock(QgsDockWidget):
         btnOpen.setIcon(QgsApplication.instance().getThemeIcon("mActionFileOpen.svg"))
         btnOpen.setPopupMode(QToolButton.InstantPopup)
         openMenu = QMenu(self)
-        actionLoadGPX = QAction("Load GPX", self)
+        actionLoadGPX = QAction("Load GPX", openMenu)
         actionLoadGPX.triggered.connect(self.loadGPX)
         openMenu.addAction(actionLoadGPX)
         openMenu.addSeparator()
-        actionLoadQgisLayer = QAction("Load QGIS vector layer", self)
+        actionLoadQgisLayer = QAction("Load QGIS vector layer", openMenu)
         actionLoadQgisLayer.triggered.connect(self.loadLayer)
         openMenu.addAction(actionLoadQgisLayer)
         btnOpen.setMenu(openMenu)
         toolBar.addWidget(btnOpen)
+
+        self.travelersGroup = QActionGroup(self)
+        self.btnBodyMetrics = QToolButton()
+        self.btnBodyMetrics.setAutoRaise(True)
+        self.btnBodyMetrics.setToolTip("Body Metrics")
+        iconPath = os.path.join(pluginPath, '', 'countroutes/img', 'users.svg')
+        icon = QIcon(iconPath)
+        self.btnBodyMetrics.setIcon(icon)
+        self.btnBodyMetrics.setPopupMode(QToolButton.InstantPopup)
+        self.travelerMenu = QMenu(self)
+        for it in self.travelerDic:
+            action = QAction(self.travelerDic[it]['name'], self.travelerMenu, checkable=True)
+            action.setObjectName(f'{it}')
+            self.travelerMenu.addAction(action)
+            self.travelersGroup.addAction(action)
+            action.triggered.connect(self.selectTraveler)
+        self.travelerMenu.actions()[self.lastActiveTraveler].setChecked(True)
+        self.travelerSeparator = self.travelerMenu.addSeparator()
+        actionCreateTraveler = QAction("Create Traveler ...", self.travelerMenu)
+        actionCreateTraveler.triggered.connect(self.createTraveler)
+        self.travelerMenu.addAction(actionCreateTraveler)
+        self.btnBodyMetrics.setMenu(self.travelerMenu)
+        self.btnBodyMetrics.setEnabled(True)
+        toolBar.addWidget(self.btnBodyMetrics)
+
+        self.chartMetrics = {1: "Elevation", 2: "Gradient", 3: "Speed", 4: "Glycogen", 5: "Fluid"}
+        self.activeChartMetric = 1
+        self.chartGroup = QActionGroup(self)
+        self.btnSelectSurfaceType = QToolButton()
+        self.btnSelectSurfaceType.setAutoRaise(True)
+        self.btnSelectSurfaceType.setToolTip("Select Graph")
+        iconPath = os.path.join(pluginPath, '', 'countroutes/img', 'charts.svg')
+        icon = QIcon(iconPath)
+        self.btnSelectSurfaceType.setIcon(icon)
+        self.btnSelectSurfaceType.setPopupMode(QToolButton.InstantPopup)
+        selectMenu = QMenu(self)
+        for it in self.chartMetrics:
+            action = QAction(self.chartMetrics[it], selectMenu, checkable=True)
+            action.setObjectName(f'{it}')
+            selectMenu.addAction(action)
+            self.chartGroup.addAction(action)
+            action.triggered.connect(self.selectChart)
+        selectMenu.actions()[self.activeChartMetric - 1].setChecked(True)
+        self.btnSelectSurfaceType.setMenu(selectMenu)
+        self.btnSelectSurfaceType.setEnabled(False)
+        toolBar.addWidget(self.btnSelectSurfaceType)
 
         self.actionSnap = QAction("Disallow snapping", self)
         self.actionSnap.setIcon(QgsApplication.instance().getThemeIcon("mIconSnapping.svg"))
@@ -585,16 +734,14 @@ class MyPlotDock(QgsDockWidget):
         self.infoDisplay = InfoDisplay(self.plotUI.typo)
         self.plotUI.showInfoDisplayData.connect(self.infoDisplay.updateData)
         layout.addWidget(self.infoDisplay)
-        layout.addStretch()
-        layout.setSpacing(0)
+        # layout.addStretch()
         widgetContainer.setLayout(layout)
         self.setWidget(widgetContainer)
 
-        self.lastProfileDir = 'lastProfileDir'
-        QgsSettings().setValue(
-            self.lastProfileDir,
-            QFileInfo(QDir.homePath()).absoluteFilePath(),
-            QgsSettings.Plugins
+        self.lastProfileDirKey = 'Plugins/countRoutesLastProfileDir'
+        self.lastProfileDir = self.settings.value(
+            self.lastProfileDirKey,
+            QFileInfo(QDir.homePath()).absoluteFilePath()
         )
         self.cachedPath = None
 
@@ -623,6 +770,54 @@ class MyPlotDock(QgsDockWidget):
 
         # First launching
         QTimer.singleShot(100, self.renderBackground)
+
+    def createTraveler(self):
+        dlg = EditTravelerDialog(
+            True,
+            self.travelerDic[self.travelerDefaultId],
+            self.travelerLimits
+        )
+        canvas = iface.mapCanvas()
+        topLeftScreenPoint = canvas.mapToGlobal(canvas.pos())
+        dlg.move(topLeftScreenPoint)
+        if dlg.exec() == QDialog.Accepted:
+            try:
+                data = dlg.getData()
+                while True:
+                    travelerId = random.randint(100000, 999999)
+                    if travelerId not in self.travelerDic:
+                        break
+                self.travelerDic[travelerId] = data
+                action = QAction(data['name'], self.travelerMenu, checkable=True)
+                action.setObjectName(f'{travelerId}')
+                self.travelersGroup.addAction(action)
+                action.triggered.connect(self.selectTraveler)
+                self.travelerMenu.insertAction(self.travelerSeparator, action)
+                action.setChecked(True)
+            except:
+                ex = "{0}".format(traceback.format_exc())
+                msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
+                print(f' renderBackground {msg}')
+
+    def selectTraveler(self):
+        selected = self.travelersGroup.checkedAction()
+        try:
+            key = int(selected.objectName())
+            if self.lastActiveTraveler != key and key in self.travelerDic.keys():
+                self.lastActiveTraveler = key
+                print(f"Traveler = {self.travelerDic[self.lastActiveTraveler]}")
+        except:
+            pass
+
+    def selectChart(self):
+        selected = self.chartGroup.checkedAction()
+        try:
+            key = int(selected.objectName())
+            if self.activeChartMetric != key and key in self.chartMetrics.keys():
+                self.activeChartMetric = key
+                print(f"Выбран график: {self.chartMetrics[self.activeChartMetric]}")
+        except:
+            pass
 
     def loadLayer(self):
         dlg = LayerSelectDialog()
@@ -757,7 +952,7 @@ class MyPlotDock(QgsDockWidget):
         p.drawText(QRectF(0, 5, vSize.width(), 30), Qt.AlignCenter, self.plotTitle)
         """
 
-        # Rendering the graph and the grid
+        # Rendering (design) the graph and the grid
 
         # Setting up fonts for scales
         p.setFont(self.plotUI.typo.scalesFont)
@@ -780,6 +975,7 @@ class MyPlotDock(QgsDockWidget):
             if xGridList[-1] + stepPx == self.dataViewSize.width():
                 xGridList.append(self.dataViewSize.width())
             for x in xGridList:
+                # This is a 2D distance value that has never been changed for any charts.
                 valX = self.viewRect.left() + (x / self.dataViewSize.width()) * self.viewRect.width()
                 text = self.plotUI.typo.gridTextFormatX.format(valX)
                 textWidth = int(sMetrics.horizontalAdvance(text))
@@ -847,11 +1043,10 @@ class MyPlotDock(QgsDockWidget):
         #     print(f' renderBackground {msg}')
 
     def loadGPX(self):
-        settings = QgsSettings()
         fileName = QFileDialog.getOpenFileName(
             self,
             'Open GPX file',
-            settings.value(self.lastProfileDir),
+            self.lastProfileDir,
             # 'C:/Users/Pavel/QField/cloud/new_kmv',
             "GPX files (*.gpx *.GPX)"
         )
@@ -867,7 +1062,8 @@ class MyPlotDock(QgsDockWidget):
             )
             return
         filePath = os.path.dirname(str(fileName[0]))
-        settings.setValue(self.lastProfileDir, filePath, QgsSettings.Plugins)
+        self.settings.setValue(self.lastProfileDirKey, filePath)
+        # self.settings.setValue(self.lastProfileDirKey, filePath, QgsSettings.Plugins)
         print(f'loadGPX: full path = {fileName[0]}, file name = {fileInfo.baseName()}')
         vectorType = ''
         geometry = None
@@ -908,7 +1104,7 @@ class MyPlotDock(QgsDockWidget):
                 "The geometry of GPX file is not valid."
             )
             return
-        elif not self.smartProfile.makeData(geometry):
+        elif not self.smartProfile.makeData(geometry, self.travelerDic[self.travelerDefaultId]):
             QMessageBox.warning(
                 None,
                 "Opening GPX file",
@@ -920,11 +1116,158 @@ class MyPlotDock(QgsDockWidget):
 
     def enableActions(self):
         if self.smartProfile.spline is not None:
+            self.btnSelectSurfaceType.setEnabled(True)
             self.actionSnap.setEnabled(True)
             self.actionLockAxis.setEnabled(True)
         else:
+            self.btnSelectSurfaceType.setEnabled(False)
             self.actionSnap.setEnabled(False)
             self.actionLockAxis.setEnabled(False)
+
+
+class EditTravelerDialog(QDialog):
+    def __init__(self, isCreated, travelerData, limits, parent=None):
+        super().__init__(parent)
+        if isCreated:
+            self.setWindowTitle("Create Traveler Body Metric")
+        else:
+            self.setWindowTitle("Edit Traveler Body Metric")
+        self.resize(300, 400)
+        layout = QVBoxLayout(self)
+        frame = QFrame(self)
+        frameLayout = QVBoxLayout(frame)
+        self.genderGroup = QButtonGroup(self)
+        dataFields = {
+            'name': {
+                'title': 'Name',
+                'units': False,
+                'decimal': False,
+                'select': False,
+                'edit': '' if isCreated else travelerData['name'],
+                'slider': False,
+                'limit': False
+            },
+            'gender': {
+                'title': 'Gender',
+                'units': False,
+                'decimal': False,
+                'select': {'m': 'Male', 'f': 'Female'},
+                'edit': False,
+                'slider': False,
+                'limit': False
+            },
+            'age': {
+                'title': 'Age',
+                'units': 'years',
+                'decimal': 0,
+                'select': False,
+                'edit': travelerData['age'],
+                'slider': True,
+                'limit': limits['age']
+            },
+            'weight': {
+                'title': 'Weight',
+                'units': 'kg',
+                'decimal': 1,
+                'select': False,
+                'edit': travelerData['weight'],
+                'slider': True,
+                'limit': limits['weight']
+            },
+            'height': {
+                'title': 'Height',
+                'units': 'cm',
+                'decimal': 0,
+                'select': False,
+                'edit': travelerData['height'],
+                'slider': True,
+                'limit': limits['height']
+            },
+            'speed': {
+                'title': 'Speed',
+                'units': 'km/h',
+                'decimal': 1,
+                'select': False,
+                'edit': travelerData['speed'],
+                'slider': True,
+                'limit': limits['speed']
+            },
+            'cargo': {
+                'title': 'Cargo',
+                'units': 'kg',
+                'decimal': 1,
+                'select': False,
+                'edit': travelerData['cargo'],
+                'slider': True,
+                'limit': limits['cargo']
+            }
+        }
+        self.dlgData = {}
+        for key, it in dataFields.items():
+            self.dlgData[key] = self._addBlock(frameLayout, key, it)
+        layout.addWidget(frame)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def _addBlock(self, parentLayout, key, data):
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        if data['limit']:
+            limit = f" ({data['limit'][0]} - {data['limit'][1]})"
+            editLine = QDoubleSpinBox()
+            editLine.setMinimum(data['limit'][0])
+            editLine.setMaximum(data['limit'][1])
+            editLine.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
+            editLine.setDecimals(data['decimal'])
+            editLine.setValue(data['edit'])
+        elif data['select']:
+            editLine = QGroupBox()
+            layout = QHBoxLayout(editLine)
+            radioMale = QRadioButton(f"{data['select']['m']}")
+            radioFemale = QRadioButton(f"{data['select']['f']}")
+            self.genderGroup.addButton(radioMale, 0)
+            self.genderGroup.addButton(radioFemale, 1)
+            radioMale.setChecked(True)
+            layout.addWidget(radioMale)
+            layout.addWidget(radioFemale)
+            editLine.setLayout(layout)
+            limit = ''
+        else:
+            editLine = QLineEdit()
+            editLine.setText(str(data['edit']))
+            limit = ''
+        if data['units']:
+            units = f" in {data['units']}"
+        else:
+            units = ''
+        title = QLabel(f"{data['title']}{limit}{units}: ")
+        block.addWidget(title)
+        block.addWidget(editLine)
+        parentLayout.addWidget(container, stretch=1)
+        return editLine
+
+    def getData(self):
+        data = {}
+        for key, it in self.dlgData.items():
+            if isinstance(it, QLineEdit):
+                data[key] = it.text().strip()
+                if not data[key]:
+                    data[key] = 'NoName'
+            elif isinstance(it, QGroupBox):
+                data[key] = True if self.genderGroup.checkedId() else False
+            else:
+                data[key] = {
+                    "age": int(it.value()),
+                    "weight": float(it.value()),
+                    "height": int(it.value()),
+                    "speed": float(it.value()),
+                    "cargo": float(it.value())
+                }[key]
+        return data
 
 
 class LayerSelectDialog(QDialog):
@@ -998,7 +1341,14 @@ class InfoDisplay(QFrame):
             layout,
             "Высота",
             "",
-            self.typo.maxTextY
+            self.typo.maxTextY,
+            True
+        )
+        self.energyLabel = self._addBlock(
+            layout,
+            "Калории",
+            "",
+            self.typo.maxTextE
         )
         self.gradLabel = self._addBlock(
             layout,
@@ -1008,7 +1358,7 @@ class InfoDisplay(QFrame):
         )
         layout.addStretch()
 
-    def _addBlock(self, parentLayout, title, initialValue, textSample):
+    def _addBlock(self, parentLayout, title, initialValue, textSample, isHidden=False):
         container = QFrame()
         container.setFixedWidth(self.getOptimalWidth(self.typo.infoFont, textSample))
         block = QVBoxLayout(container)
@@ -1033,6 +1383,8 @@ class InfoDisplay(QFrame):
         # block.addWidget(t_lbl)
         # block.addWidget(v_lbl)
         parentLayout.addWidget(container, stretch=1)
+        if isHidden:
+            container.setVisible(False)
         return vLbl
 
     def getOptimalWidth(self, font, sampleText):
@@ -1044,8 +1396,12 @@ class InfoDisplay(QFrame):
             self.distLabel.setText(data['distance'])
             self.elevLabel.setText(data['elevation'])
             self.gradLabel.setText(data['gradient'])
+            self.energyLabel.setText(data['energy'])
         except:
             pass
+            # ex = "{0}".format(traceback.format_exc())
+            # msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
+            # print(f' renderBackground {msg}')
 
 
 class ProfileRubberBandLine(QgsRubberBand):
@@ -1093,4 +1449,3 @@ class ProfileRubberBandPoint(QgsRubberBand):
         self.setSecondaryStrokeColor(QColor(255, 255, 255, 100))
         self.setColor(QColor(0, 0, 0))
         self.hide()
-
