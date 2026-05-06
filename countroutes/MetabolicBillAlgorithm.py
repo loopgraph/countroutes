@@ -28,14 +28,14 @@ import scipy.optimize as opt
 # Constants and limitations
 slopeLimit = (-0.45, 0.45)
 elevationLimit = (-450, 9000)
-TERRAIN_COEFFS = {
-    'asphalt': 1.0,
-    'dirt': 1.1,  # Грунтовая дорога
-    'trail': 1.2,  # Лесная тропа
-    'grass': 1.5,  # Высокая трава
-    'sand': 1.8,  # Песок
-    'snow': 2.1  # Глубокий снег
-}
+TERRAIN_COEFFS = [
+    1.0,     # asphalt
+    1.1,        # dirt
+    1.2,       # trail
+    1.5,       # grass
+    1.8,        # sand
+    2.1         # snow
+]
 TEMPERATURES_LIMIT = (-40, 50)
 HUMIDITY_LIMIT = (0.0, 1.0)
 G = 9.81
@@ -55,7 +55,8 @@ AGE_LIMIT = (12, 120)
 WEIGHT_LIMIT = (30, 200)
 HEIGHT_LIMIT = (140, 250)
 DEFAULT_TEMPERATURE = 20.0
-DEFAULT_HUMIDITY = 0.5
+DEFAULT_HUMIDITY = 0.0
+DEFAULT_ETA = 1.0
 # Concentrations of glycogen loss per 1 ml of fluid loss
 #   for the choice of a hypotonic or isotonic:
 TONIC_BALANCE = (0.04, 0.08)
@@ -174,9 +175,9 @@ def prepareEnergyData(
     age,
     isMale,
     vInputKmh,
-    terrainEta,
-    temperatureMap,
-    humidityMap,
+    etaSpline,
+    temperatureSpline,
+    humiditySpline,
     massPack=0,
     isOptimizedSpeed=True
 ):
@@ -405,25 +406,24 @@ def prepareEnergyData(
     # ---- Построение сплайнов CubicSpline от дистанции ---------
     cumulativeKcal = [0.0]
     currentTotalEnergy = 0.0
-    if isinstance(terrainEta, list) and len(terrainEta) == len(distances):
-        etaList = [TERRAIN_COEFFS.get(terrainEta[i], 1.0) for i in range(len(distances))]
-    elif isinstance(terrainEta, str):
-        etaList = [TERRAIN_COEFFS.get(terrainEta, 1.0) for _ in range(len(distances))]
-    else:
-        etaList = [1.0 for _ in range(len(distances))]
-    if isinstance(temperatureMap, list) and len(temperatureMap) == len(distances):
-        tempList = [temperatureMap[i] if isinstance(temperatureMap[i], (float, int) and
-                TEMPERATURES_LIMIT[0] <= temperatureMap[i] <= TEMPERATURES_LIMIT[1]) else
-                    DEFAULT_TEMPERATURE for i in range(len(distances))]
-    else:
-        tempList = [DEFAULT_TEMPERATURE for _ in range(len(distances))]
-    if isinstance(humidityMap, list) and len(humidityMap) == len(distances):
-        humidityList = [humidityMap[i] if isinstance(humidityMap[i], (float, int) and
-                HUMIDITY_LIMIT[0] <= humidityMap[i] <= HUMIDITY_LIMIT[1]) else
-                    DEFAULT_HUMIDITY for i in range(len(distances))]
-    else:
-        humidityList = [DEFAULT_HUMIDITY for _ in range(len(distances))]
-
+    isValidEta = False
+    if isinstance(etaSpline, interp1d) and etaSpline.x[0] >= distances[0] and etaSpline.x[-1] <= distances[-1]:
+        isValidEta = np.isin(etaSpline.y, TERRAIN_COEFFS).all()
+    isValidTemp = True
+    # isValidTemp = False
+    # if (isinstance(temperatureSpline, CubicSpline) and
+    #     temperatureSpline.x[0] >= distances[0] and temperatureSpline.x[-1] <= distances[-1]):
+    #     isValidTemp = np.all(
+    #         (temperatureSpline.y >= TEMPERATURES_LIMIT[0]) & (temperatureSpline.y <= TEMPERATURES_LIMIT[1])
+    #     )
+    isValidHum = True
+    # isValidHum = False
+    # if (isinstance(humiditySpline, CubicSpline) and
+    #     humiditySpline.x[0] >= distances[0] and humiditySpline.x[-1] <= distances[-1]):
+    #     isValidHum = np.all(
+    #         (humiditySpline.y >= HUMIDITY_LIMIT[0]) & (humiditySpline.y <= HUMIDITY_LIMIT[1])
+    #     )
+    print(f'isValidTemp = {isValidTemp}, isValidHum = {isValidHum}, isValidEta = {isValidEta}')
     currentGly = baseGlycogen
     cumulativeGly = [currentGly]
     lastRechargeT = -MIN_RECHARGE_GAP_SEC
@@ -449,8 +449,8 @@ def prepareEnergyData(
                     pRest,
                     grade,
                     elev,
-                    etaList[i],
-                    tempList[i],
+                    etaSpline.y[i] if isValidEta else DEFAULT_ETA,
+                    temperatureSpline(x) if isValidTemp else DEFAULT_TEMPERATURE,
                     True
                 )
             )
@@ -463,8 +463,8 @@ def prepareEnergyData(
                 pRest,
                 grade,
                 elev,
-                etaList[i],
-                tempList[i],
+                etaSpline.y[i] if isValidEta else DEFAULT_ETA,
+                temperatureSpline(x) if isValidTemp else DEFAULT_TEMPERATURE,
                 False
             )
         cumulativeSpeed.append(speed)
@@ -491,8 +491,8 @@ def prepareEnergyData(
                 lastRechargeT,
                 currentGly,
                 fluidLoss,
-                humidityList[i],
-                tempList[i],
+                humiditySpline(x) if isValidHum else DEFAULT_HUMIDITY,
+                temperatureSpline(x) if isValidTemp else DEFAULT_TEMPERATURE,
                 baseGlycogen,
                 dehydrationLimit,
                 rechargesPlan,
