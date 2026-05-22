@@ -26,11 +26,12 @@ from scipy.optimize import minimize_scalar
 import scipy.optimize as opt
 
 # Constants and limitations
+DISTANCE_STEP = 5
 slopeLimit = (-0.45, 0.45)
 elevationLimit = (-450, 9000)
 TERRAIN_COEFFS = [
     1.0,     # asphalt
-    1.1,        # dirt
+    # 1.1,        # dirt
     1.2,       # trail
     1.5,       # grass
     1.8,        # sand
@@ -95,8 +96,8 @@ def prepareElevationData(
         # Если бег, уменьшаем окно с 21 до 13
         savgolWin = 13 if activityType == 'run' else 21
     else:
-        # Для DEM: шаг 5 метров, чтобы сгладить "пиксели"
-        targetX = np.arange(distances[0], distances[-1], 5)
+        # Для DEM: шаг DISTANCE_STEP метров, чтобы сгладить "пиксели"
+        targetX = np.arange(distances[0], distances[-1], DISTANCE_STEP)
         hInterp = np.interp(targetX, distances, elevations)
         dInterp = targetX
         # Окно фильтрации (в метрах): ~1.5-2.0 от разрешения DEM

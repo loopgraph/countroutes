@@ -1,6 +1,6 @@
 from qgis.PyQt.QtCore import (Qt, QPointF, QRectF, QObject, QEvent, QTimer, QSize, QFileInfo, QDir, QRect,
                               pyqtSignal, QThread, QDate, QLocale)
-from qgis.PyQt.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QBrush,
+from qgis.PyQt.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QBrush, QLinearGradient,
                              QFont, QPolygonF, QFontMetrics, QPainterPath, QPolygonF, QIcon)
 from qgis.PyQt.QtWidgets import (QWidget, QAction, QActionGroup, QGraphicsPixmapItem, QGraphicsLineItem,
                                  QGraphicsSimpleTextItem, QApplication, QToolBar, QMenu, QStyleOption, QStyle,
@@ -8,7 +8,7 @@ from qgis.PyQt.QtWidgets import (QWidget, QAction, QActionGroup, QGraphicsPixmap
                                  QDialogButtonBox, QListWidgetItem, QListWidget, QGroupBox, QRadioButton,
                                  QFrame, QHBoxLayout, QLabel, QDoubleSpinBox, QLineEdit, QButtonGroup,
                                  QPushButton, QSpinBox, QGridLayout, QDateEdit, QSizePolicy, QProgressBar,
-                                 QGraphicsEllipseItem, QGraphicsItem)
+                                 QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem)
 import numpy as np
 from scipy.interpolate import CubicSpline, UnivariateSpline, interp1d
 from scipy.signal import savgol_filter
@@ -64,6 +64,7 @@ class Typography:
     minDataPixWidth: int = 20
     minDataPixHeight: int = 10
     plotPointsShare: float = 0.4  # Points share of the total x-pixels for graph plotting (< 1)
+    maxPointsOpenTopoData: int = 100    # Limit of points per package in Open Topo Data
     cursorColor: QColor = field(default_factory=lambda: QColor(255, 50, 50, 200))
     labelColor: QColor = field(default_factory=lambda: QColor(150, 0, 0))
     gridColor: QColor = field(default_factory=lambda: QColor(235, 235, 235))
@@ -103,7 +104,7 @@ class Typography:
     xGridCounts: list = field(init=False)
     indent: namedtuple = field(init=False)
     weatherPointsStruct: dict = field(init=False)
-    etaStruct: dict = field(init=False)
+    etaData: dict = field(init=False)
     style2: str = field(init=False)
 
     def __post_init__(self):
@@ -219,17 +220,34 @@ class Typography:
             'temp': 4,
             'rh': 5
         }
-        self.etaStruct = {
-            'asphalt': 1.0,
-            'dirt': 1.1,
-            'trail': 1.2,
-            'grass': 1.5,
-            'sand': 1.8,
-            'snow': 2.1
+        self.etaData = {
+            1.0: {
+                'name': 'asphalt',
+                'color': QColor(200, 200, 200, 100),  # Pale gray
+            },
+            1.2: {
+                'name': 'trail',
+                'color': QColor(210, 180, 140, 100),  # Brown pale
+            },
+            1.5: {
+                'name': 'grass',
+                'color': QColor(144, 238, 144, 100),  # Green pale
+            },
+            1.8: {
+                'name': 'sand',
+                'color': QColor(255, 250, 205, 100),  # Pale yellow
+            },
+            2.1: {
+                'name': 'snow',
+                'color': QColor(240, 248, 255, 100)  # Bluish-white
+            }
         }
 
 
 class SmartProfile:
+    altitudeSamplingStep: int = 10  # The distance step (in meters) for getting elevation data from external sources
+    altitudeDelayOpenTopoData: float = 1.2  # Latency for Open Topo Data (server requires > 1 sec between requests)
+    altitudeDelayUSGS: float = 0.2  # Latency for USGS API (between individual requests)
     def __init__(self, mbModule):
         self.x = None
         self.y = None
@@ -240,6 +258,7 @@ class SmartProfile:
         self.fluidLossSpline = None
         self.speedSpline = None
         self.etaSpline = None
+        self.etaSegments = []
         self.etaArray = None
         self.temperatureSpline = None
         self.humiditySpline = None
@@ -260,6 +279,7 @@ class SmartProfile:
         self.mbModule = mbModule
         self.totalCalories = 0.0
         self.weatherPoints = []
+        self.altitudePoints = []
         self.moveCursor = None
 
     def makeData(self, geometryZ, bodyMetric):
@@ -288,18 +308,20 @@ class SmartProfile:
             return False
 
         # Preparing coordinates
-        xList = [0.0]
-        yList = [lineString.zAt(0)]
-        dist = 0.0
-        for i in range(1, lineString.numPoints()):
-            dist += da.measureLine(
-                QgsPointXY(geom2D.get().pointN(i - 1)),
-                QgsPointXY(geom2D.get().pointN(i))
-            )
-            xList.append(dist)
-            yList.append(lineString.zAt(i))
-        xRaw = np.array(xList)
-        yRaw = np.array(yList)
+        pL = list(range(lineString.numPoints()))
+        xRaw = np.cumsum(
+            np.array([
+                da.measureLine(
+                    QgsPointXY(geom2D.get().pointN(i)),
+                    QgsPointXY(geom2D.get().pointN(j))
+                ) for i, j in zip(pL[:-1], pL[1:])
+            ])
+        )
+        xRaw = np.concatenate(([0.0], xRaw))
+        if lineString.is3D():
+            yRaw = np.array([lineString.zAt(i) for i in range(lineString.numPoints())])
+        else:
+            yRaw = None
 
         (
             self.x,
@@ -314,8 +336,9 @@ class SmartProfile:
             rmse,
             gainError
         ) = self.mbModule.prepareElevationData(xRaw, yRaw, mode='route')
-        data = [{'mask': (self.x >= self.x[0]) & (self.x <= self.x[-1]), 'value': 1.0}]
-        self.etaSpline = self.createEtaSpline(data)
+        self.etaSegments = [[0.0, 1.0, float(self.mbModule.DEFAULT_ETA)]]
+        self.etaArray = self.buildEtaArray()
+        self.etaSpline = self.createEtaSpline()
         # self.etaArray = np.ones_like(self.x)
         # mask = (self.x >= self.x[0]) & (self.x <= self.x[-1])
         # self.etaArray[mask] = 1.0   # Setting asphalt to init
@@ -330,19 +353,31 @@ class SmartProfile:
         # Adaptive number of points (from 3 to 7 per 100 km)
         totalLengthKm = totalLength / 1000
         numPoints = 3 if totalLengthKm < 30 else (5 if totalLengthKm < 70 else 7)
+        crsSrc = QgsProject.instance().crs()
+        crsWGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        transform = QgsCoordinateTransform(crsSrc, crsWGS84, QgsProject.instance())
         for i in range(numPoints):
             d = (totalLength / (numPoints - 1)) * i
+            print(f'Points: d = {d}, type = {type(d)}')
             point = geom2D.interpolate(d)
             h = float(self.spline(d))
-            crsSrc = QgsProject.instance().crs()
-            crsWGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
-            transform = QgsCoordinateTransform(crsSrc, crsWGS84, QgsProject.instance())
+            # crsSrc = QgsProject.instance().crs()
+            # crsWGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+            # transform = QgsCoordinateTransform(crsSrc, crsWGS84, QgsProject.instance())
             pt = point.asPoint()
             ptWGS84 = transform.transform(pt)
             self.weatherPoints.append(
                 (ptWGS84.y(), ptWGS84.x(), d, h, self.mbModule.DEFAULT_TEMPERATURE, self.mbModule.DEFAULT_HUMIDITY)
             )
         print(f'Result points for temperature and humidity building = {self.weatherPoints}')
+
+        altitudeX = np.arange(0.0, totalLength, self.altitudeSamplingStep)
+        self.altitudePoints = []
+        for x in altitudeX:
+            point = geom2D.interpolate(float(x))
+            pt = point.asPoint()
+            ptWGS84 = transform.transform(pt)
+            self.altitudePoints.append({"lat": ptWGS84.y(), "lon": ptWGS84.x(), "dist": float(x), "elev": None})
 
         tData = []
         hData = []
@@ -394,21 +429,42 @@ class SmartProfile:
                 isOptimizedSpeed=False
             )
         print(f'Total calories = {self.totalCalories} kcal')
-
         return True
 
-    def createEtaSpline(self, data):
-        etaArray = np.ones_like(self.x)
-        for it in data:
-            etaArray[it['mask']] = it['value']
+    def buildEtaArray(self):
+        etaArray = np.full_like(self.x, self.mbModule.DEFAULT_ETA, dtype=float)
+        for start, end, eta in self.etaSegments:
+            mask = (self.x >= start * self.x[-1]) & (self.x <= end * self.x[-1])
+            etaArray[mask] = eta
+        return etaArray
+
+    def createEtaSpline(self, data=None):
+        if data:
+            start, end = float(data['start']) / self.x[-1], float(data['end'] / self.x[-1])
+            newSegments = []
+            for s, e, eta in self.etaSegments:
+                if e <= start or s >= end:
+                    newSegments.append([s, e, eta])
+                else:
+                    if s < start:
+                        newSegments.append([s, start, eta])
+                    if e > end:
+                        newSegments.append([end, e, eta])
+            newSegments.append([start, end, data['etaValue']])
+            self.etaSegments = sorted(newSegments, key=lambda x: x[0])
+            self.etaArray = self.buildEtaArray()
+
         spline = interp1d(
             self.x,
-            etaArray,
+            self.etaArray,
             kind='nearest',
             bounds_error=False,
             fill_value="extrapolate"
         )
         return spline
+
+    def getEtaSegments(self):
+        return [tuple(seg) for seg in self.etaSegments]
 
     @staticmethod
     def createCubicSpline(data):
@@ -552,6 +608,8 @@ class SmartProfile:
 class PlotInteraction(QObject):
     # Managing native C++ scene elements (without overriding Python paint)
     showInfoDisplayData = pyqtSignal(object)
+    setSelection = pyqtSignal(float, float)
+    selectionUnavailable = pyqtSignal()
 
     def __init__(self, canvas, smartProfile, isConstructed=False):
         super().__init__()
@@ -576,6 +634,7 @@ class PlotInteraction(QObject):
             'humidity': '',
             'eta': ''
         }
+        self.minimalSelectionWidth = 2
         # 1) Background (curve and grid)
         self.background = QGraphicsPixmapItem()
         # It's important for High DPI: switch off smoothing when scaling this item
@@ -606,6 +665,55 @@ class PlotInteraction(QObject):
 
         # 4) The list of points of QGraphicsEllipseItem to show weather information
         self.profilePointsList = []
+
+        # 5) The rect object to select canvas area for eta settings
+        self.etaSelector = QGraphicsRectItem()
+        self.etaSelector.setZValue(10)
+        self.etaSelector.setBrush(QBrush(QColor(255, 255, 0, 80)))
+        self.etaSelector.setPen(QPen(QColor(255, 200, 0), 1, Qt.SolidLine))
+        self.scene.addItem(self.etaSelector)
+        self.etaSelector.hide()
+
+    def updateSelection(self, startX, endX, viewRect, dataViewSize):
+        if startX != endX:
+            realXStart = self.xRealOffset + startX * self.gsd
+            realXEnd = self.xRealOffset + endX * self.gsd
+            if (
+                    viewRect.right() >= realXStart >= viewRect.left() and
+                    viewRect.right() >= realXEnd >= viewRect.left()
+            ):
+                sRect = self.scene.sceneRect()
+                x = min(startX, endX)
+                width = abs(endX - startX)
+                indent = self.typo.indent
+                self.etaSelector.setRect(x, sRect.top(), width, dataViewSize.height() + indent.top)
+                if not self.etaSelector.isVisible(): self.etaSelector.show()
+
+    def setSelectionBounds(self, startX, endX, viewRect):
+        if abs(startX - endX) <= self.minimalSelectionWidth:
+            return
+        xStart = min(startX, endX)
+        xEnd = max(startX, endX)
+        realXStart = self.xRealOffset + xStart * self.gsd
+        realXEnd = self.xRealOffset + xEnd * self.gsd
+        if realXStart > viewRect.right() or realXEnd < viewRect.left():
+            return
+        realXStart = max(viewRect.left(), realXStart)
+        realXEnd = min(viewRect.right(), realXEnd)
+        self.setSelection.emit(realXStart, realXEnd)
+
+    def resizeSelection(self, realXStart, realXEnd, dataViewSize):
+        if not self.etaSelector.isVisible(): return
+        indent = self.typo.indent
+        xStart = max(int((realXStart - self.xRealOffset) / self.gsd), indent.left + 1)
+        xEnd = min(int((realXEnd - self.xRealOffset) / self.gsd), dataViewSize.width() + indent.left)
+        width = abs(xStart - xEnd)
+        sRect = self.scene.sceneRect()
+        self.etaSelector.setRect(xStart, sRect.top(), width, dataViewSize.height() + indent.top)
+
+    def hideSelection(self):
+        self.etaSelector.hide()
+        self.selectionUnavailable.emit()
 
     def createPoints(self):
         if self.smartProfile.weatherPoints:
@@ -712,7 +820,7 @@ class PlotInteraction(QObject):
         else:
             self.labelY.setPos(sRect.left() + offset - 1, y - yTextHeight - 2 * offset)
 
-        surfaceType = next((k for k, v in self.typo.etaStruct.items() if v == eta), '')
+        surfaceType = next((v['name'] for k, v in self.typo.etaData.items() if k == eta), '')
         distInfo, elevInfo, gradInfo, energyInfo, tempInfo, rhInfo, etaInfo = (
             self.typo.distanceTextFormatInfo.format(realX),
             self.typo.elevationTextFormatInfo.format(realY),
@@ -810,7 +918,7 @@ class PlotInteraction(QObject):
         else:
             self.labelY.setPos(sRect.left() + offset - 1, y - yTextHeight - 2 * offset)
 
-        surfaceType = next((k for k, v in self.typo.etaStruct.items() if v == eta), '')
+        surfaceType = next((v['name'] for k, v in self.typo.etaData.items() if k == eta), '')
         distInfo, elevInfo, gradInfo, energyInfo, tempInfo, rhInfo, etaInfo = (
             self.typo.distanceTextFormatInfo.format(realX),
             self.typo.elevationTextFormatInfo.format(realY),
@@ -874,33 +982,55 @@ class CanvasFilter(QObject):
         super().__init__()
         self.dock = dock
         self.lastMousePos = None
-        self.isPanning = False
-        self.pressTimer = QTimer(self)
-        self.pressTimer.setSingleShot(True)
-        self.pressTimer.timeout.connect(self._setClosedHand)
-        self.releaseTimer = QTimer(self)
-        self.releaseTimer.setSingleShot(True)
-        self.releaseTimer.timeout.connect(self._resetCursor)
+        self.originMousePos = None
+        # self.isPanning = False
+        self.isSelecting = False
+        # self.pressTimer = QTimer(self)
+        # self.pressTimer.setSingleShot(True)
+        # self.pressTimer.timeout.connect(self._setClosedHand)
+        # self.releaseTimer = QTimer(self)
+        # self.releaseTimer.setSingleShot(True)
+        # self.releaseTimer.timeout.connect(self._resetCursor)
 
-    def _setClosedHand(self):
-        QApplication.setOverrideCursor(Qt.ClosedHandCursor)
-
-    def _resetCursor(self):
-        self._clearOverrides()
-
-    def _clearOverrides(self):
-        while QApplication.overrideCursor() is not None:
-            QApplication.restoreOverrideCursor()
-
+    # def _setClosedHand(self):
+    #     QApplication.setOverrideCursor(Qt.ClosedHandCursor)
+    #
+    # def _resetCursor(self):
+    #     self._clearOverrides()
+    #
+    # def _clearOverrides(self):
+    #     while QApplication.overrideCursor() is not None:
+    #         QApplication.restoreOverrideCursor()
+    #
     def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+            if isinstance(self.dock, MountProfileDialog):
+                pos = event.pos()
+                QTimer.singleShot(0, lambda: self.dock.contextEtaMenu(pos))
+                # sPos = self.dock.canvas.mapToScene(event.pos())
+            return True
+
+        if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.RightButton:
+            return True
+
         if event.type() == QEvent.MouseMove:
             if event.buttons() & Qt.LeftButton:
-                if not self.isPanning:
-                    self.dock.plotUI.hideCursor()
-                    QApplication.setOverrideCursor(Qt.OpenHandCursor)
-                    self.pressTimer.start(150)
-                    self.isPanning = True
-                    self.lastMousePos = event.pos()
+                # if not self.isPanning:
+                #     self.dock.plotUI.hideCursor()
+                #     QApplication.setOverrideCursor(Qt.OpenHandCursor)
+                #     self.pressTimer.start(150)
+                #     self.isPanning = True
+                #     self.lastMousePos = event.pos()
+                if isinstance(self.dock, MountProfileDialog):
+                    if self.originMousePos is not None:
+                        sPos = self.dock.canvas.mapToScene(event.pos())
+                        self.lastMousePos = sPos.x()
+                        self.dock.plotUI.updateSelection(
+                            self.originMousePos,
+                            self.lastMousePos,
+                            self.dock.viewRect,
+                            self.dock.dataViewSize,
+                        )
             else:
                 sPos = self.dock.canvas.mapToScene(event.pos())
                 # viewportSize = self.dock.canvas.viewport().size()
@@ -909,34 +1039,82 @@ class CanvasFilter(QObject):
                     self.dock.viewRect,
                     self.dock.dataViewSize,
                 )
-
-        elif event.type() == QEvent.Leave:
-            self.isPanning = False
-            self.dock.plotUI.hideCursor()
-
-        elif event.type() == QEvent.Wheel:
-            delta = event.angleDelta().y()
-            scale = 1.15 if delta < 0 else 0.85
-            sPos = self.dock.canvas.mapToScene(event.pos())
-            self.dock.zoomAtPoint(scale, sPos)
             return True
 
-        elif event.type() == QEvent.Resize:
-            self.isPanning = False
-            self.dock.resizeTimer.start(50)  # Short delay for smoothness
+        if (
+                event.type() == QEvent.MouseButtonPress and
+                event.button() == Qt.LeftButton and
+                isinstance(self.dock, MountProfileDialog)
+        ):
+            sPos = self.dock.canvas.mapToScene(event.pos())
+            self.originMousePos = sPos.x()
+            self.lastMousePos = None
+            return True
 
-        elif event.type() == QEvent.MouseButtonRelease:
-            if event.button() == Qt.LeftButton:
-                if (self.isPanning and self.lastMousePos is not None and
-                        self.dock.panning(self.lastMousePos, event.pos())):
-                    self.dock.resizeTimer.start(50)  # Short delay for smoothness
-                self.pressTimer.stop()
-                self._clearOverrides()
-                QApplication.setOverrideCursor(Qt.OpenHandCursor)
-                self.releaseTimer.start(150)
+        if (
+                event.type() == QEvent.MouseButtonRelease and
+                event.button() == Qt.LeftButton and
+                isinstance(self.dock, MountProfileDialog)
+        ):
+            # if event.button() == Qt.LeftButton:
+                # if (self.isPanning and self.lastMousePos is not None and
+                #         self.dock.panning(self.lastMousePos, event.pos())):
+                #     self.dock.resizeTimer.start(50)  # Short delay for smoothness
+                # self.pressTimer.stop()
+                # self._clearOverrides()
+                # QApplication.setOverrideCursor(Qt.OpenHandCursor)
+                # self.releaseTimer.start(150)
+                # self.lastMousePos = None
+                # self.isPanning = False
+                # return True
+
+            if (
+                (
+                    self.lastMousePos is not None and
+                    abs(self.lastMousePos - self.originMousePos) <= self.dock.plotUI.minimalSelectionWidth
+                ) or
+                self.lastMousePos is None
+            ):
                 self.lastMousePos = None
-                self.isPanning = False
-                return True
+                self.originMousePos = None
+                self.dock.plotUI.hideSelection()
+            else:
+                self.dock.plotUI.setSelectionBounds(
+                    self.originMousePos,
+                    self.lastMousePos,
+                    self.dock.viewRect
+                )
+            return True
+
+        # elif (
+        #         event.type() == QEvent.ContextMenu and
+        #         isinstance(self.dock, MountProfileDialog)
+        # ):
+        #     pos = event.pos()
+        #     QTimer.singleShot(0, lambda: self.dock.plotUI.openContextMenu(pos))
+        #     # sPos = self.dock.canvas.mapToScene(event.pos())
+        #     return True
+        #
+        # elif event.type() == QEvent.Leave:
+        #     self.isPanning = False
+        #     self.dock.plotUI.hideCursor()
+
+        if event.type() == QEvent.Leave:
+            self.isSelecting = False
+            self.dock.plotUI.hideCursor()
+            return True
+
+        # elif event.type() == QEvent.Wheel:
+        #     delta = event.angleDelta().y()
+        #     scale = 1.15 if delta < 0 else 0.85
+        #     sPos = self.dock.canvas.mapToScene(event.pos())
+        #     self.dock.zoomAtPoint(scale, sPos)
+        #     return True
+
+        if event.type() == QEvent.Resize:
+            # self.isPanning = False
+            self.dock.resizeTimer.start(50)  # Short delay for smoothness
+            return True
 
         return False
 
@@ -946,9 +1124,21 @@ class SelectableMenuWidget(QWidget):
     editRequested = pyqtSignal()
     selected = pyqtSignal()
 
-    def __init__(self, text, parent=None, isEdited=False, isDeleted=False, isNoButtons=False, isNoDotLabel=False):
+    def __init__(
+            self,
+            text,
+            parent=None,
+            isEdited=False,
+            isDeleted=False,
+            isNoButtons=False,
+            isNoDotLabel=False,
+            # isMenuToBeClosed=False,
+            color=None,
+            dpr=None
+    ):
         super().__init__(parent)
         self.setObjectName("CustomMenuWidget")
+        # self.isMenuToBeClosed = isMenuToBeClosed
         # self.setAttribute(Qt.WA_Hover)
 
         # self.originalText = text  # Сохраняем чистый текст
@@ -999,6 +1189,10 @@ class SelectableMenuWidget(QWidget):
             layout.addWidget(self.deleteBtn)
             self.deleteBtn.installEventFilter(self)
             self.setButtonsVisible(isEdited, isDeleted)
+
+        if color is not None and dpr is not None:
+            widget = ColorRectLabel(20, color, dpr)
+            layout.addWidget(widget)
 
     def setButtonsVisible(self, isEdited, isDeleted):
         self.editBtn.setVisible(isEdited)
@@ -1065,7 +1259,12 @@ class SelectableMenuWidget(QWidget):
 
     def eventFilter(self, obj, event):
         # Перехватываем клик, чтобы меню не закрылось
-        if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+        if (
+                event.type() == QEvent.MouseButtonRelease and
+                event.button() == Qt.LeftButton
+                # event.button() == Qt.LeftButton and
+                # not self.isMenuToBeClosed
+        ):
             if obj == self.editBtn: self.editRequested.emit()
             if obj == self.delBtn: self.deleteRequested.emit()
             return True  # Сообщаем QMenu, что событие обработано и закрываться не нужно
@@ -1074,6 +1273,36 @@ class SelectableMenuWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.selected.emit()
+
+
+class ColorRectLabel(QLabel):
+    def __init__(self, width, color, dpr, height=20):
+        super().__init__()
+        self.setFixedWidth(width)
+        self.setStyleSheet("border: none; background: transparent; padding: 0px; margin: 0px;")
+        self.rectColor = color
+        self.rectWidth = width
+        self.dpr = dpr
+        self.generatePixmap(height)
+
+    def generatePixmap(self, h):
+        if h <= 0: h = 3
+        w = self.rectWidth
+        rectSize = QSize(w, h)
+        buffer = QImage(rectSize * self.dpr, QImage.Format_ARGB32_Premultiplied)
+        buffer.setDevicePixelRatio(self.dpr)
+        buffer.fill(Qt.white)
+        painter = QPainter(buffer)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(Qt.darkGray, 0))
+        painter.setBrush(QColor(self.rectColor))
+        painter.drawRect(0, 0, w - 1, h - 1)
+        painter.end()
+        self.setPixmap(QPixmap.fromImage(buffer))
+
+    def resizeEvent(self, event):
+        self.generatePixmap(event.size().height())
+        super().resizeEvent(event)
 
 
 class MyPlotDock(QgsDockWidget):
@@ -1315,6 +1544,10 @@ class MyPlotDock(QgsDockWidget):
 
         # First launching
         QTimer.singleShot(100, self.renderBackground)
+
+    def getDPR(self):
+        viewport = self.canvas.viewport()
+        return viewport.devicePixelRatioF()
 
     def addBioMetric(self, name, actName):
         action = QWidgetAction(self.travelerMenu)
@@ -1780,8 +2013,13 @@ class MountProfileDialog(QDialog):
         layout.addWidget(toolBar)
         layout.addWidget(self.canvas, stretch=1)
 
-        self.conditionsDisplay = ConditionsDisplay(self.plotUI.typo)
+        self.conditionsDisplay = ConditionsDisplay(self.plotUI.typo, self.getDPR())
         self.plotUI.showInfoDisplayData.connect(self.conditionsDisplay.updateData)
+        self.plotUI.setSelection.connect(self.setSelection)
+        self.plotUI.selectionUnavailable.connect(self.setSelectionUnavailable)
+        self.selectionStart = None
+        self.selectionEnd = None
+        self.isSelectionAvailable = False
         layout.addWidget(self.conditionsDisplay)
 
         tempLimits = self.smartProfile.mbModule.TEMPERATURES_LIMIT
@@ -1853,6 +2091,12 @@ class MountProfileDialog(QDialog):
         bottomLayout.addWidget(self.buttonBox)
         layout.addLayout(bottomLayout)
 
+        self.etaMenu = QMenu()
+        etaData = self.plotUI.typo.etaData
+        for key in sorted([k for k in etaData]):
+            action = self.addEtaType(etaData[key]['name'], etaData[key]['color'])
+            self.etaMenu.addAction(action)
+
         self.resizeTimer = QTimer()
         self.resizeTimer.setSingleShot(True)
         self.resizeTimer.timeout.connect(self.renderDialogBackground)
@@ -1865,6 +2109,64 @@ class MountProfileDialog(QDialog):
         self.timerUpdateData.setSingleShot(True)
         self.timerUpdateData.timeout.connect(self.updateDataSpline)
         self.dataToUpdate = {}
+
+    def getDPR(self):
+        viewport = self.canvas.viewport()
+        return viewport.devicePixelRatioF()
+
+    def addEtaType(self, name, color):
+        action = QWidgetAction(self.etaMenu)
+        widget = SelectableMenuWidget(name, isNoButtons=True, isNoDotLabel=True, color=color, dpr=self.getDPR())
+        action.setDefaultWidget(widget)
+        action.setObjectName(name)
+        widget.selected.connect(lambda: self.selectEtaType(action))
+        return action
+
+    def selectEtaType(self, action):
+        self.etaMenu.hide()
+        if self.isSelectionAvailable:
+            etaData = self.plotUI.typo.etaData
+            data = {
+                'start': self.selectionStart,
+                'end': self.selectionEnd,
+                'etaValue': next((k for k, v in etaData.items() if v['name'] == action.objectName()), 1.0)
+            }
+            self.smartProfile.changeEditSpline('eta', data)
+            self.resizeTimer.start(50)
+            self.plotUI.hideSelection()
+        print(f'Select action = {action.objectName()}')
+
+    def contextEtaMenu(self, pos):
+        if self.isSelectionAvailable:
+            print(f'pos = {type(pos)}')
+            print(f'pos = {self.canvas.mapToGlobal(pos)}')
+            self.etaMenu.exec_(self.canvas.mapToGlobal(pos))
+        else:
+            QMessageBox.warning(
+                None,
+                "Setting surface type",
+                ("No area selected to set surface type.\n"
+                 "Please select an area using the mouse with the left button pressed.")
+            )
+
+    @staticmethod
+    def addSimpleAction(menu, name, actName, actionMethod, isNoDotLabel=True, isNoButtons=True):
+        action = QWidgetAction(menu)
+        widget = SelectableMenuWidget(name, isNoDotLabel=isNoDotLabel, isNoButtons=isNoButtons)
+        action.setDefaultWidget(widget)
+        action.setObjectName(actName)
+        widget.selected.connect(actionMethod)
+        return action
+
+    def setSelection(self, xStart, xEnd):
+        self.selectionStart = xStart
+        self.selectionEnd = xEnd
+        print(f'xStart = {xStart}, xEnd = {xEnd}')
+        self.isSelectionAvailable = True
+
+    def setSelectionUnavailable(self):
+        self.isSelectionAvailable = False
+        print('Selection is unavailable.')
 
     def toggleData(self, idx, isToggled):
         if isToggled:
@@ -1996,6 +2298,38 @@ class MountProfileDialog(QDialog):
         lift = int(vSize.height() - QFontMetrics(self.plotUI.typo.labelFont).ascent())
         # fontHeight = QFontMetrics(self.plotUI.typo.scalesFont).height()
 
+        if self.smartProfile.x is not None:
+            path = self.smartProfile.getPainterElevationProfile(
+                self.viewRect,
+                indent,
+                self.dataViewSize,
+                self.plotUI.typo.plotPointsShare,
+                self.plotUI.isAxisRatioLocked
+            )
+            etaSegments = self.smartProfile.getEtaSegments()
+            # print(f'etaSegments = {etaSegments}')
+            plotLeft = indent.left
+            plotRight = vSize.width() - indent.right
+            plotBottom = vSize.height() - indent.bottom + 1
+            plotTop = indent.top
+            plotHeight = plotBottom - plotTop
+            plotWidth = plotRight - plotLeft
+            p.setPen(Qt.NoPen)
+            # xEndLast = plotRight
+            xStart = plotLeft
+            for it in etaSegments:  # [(startX in %, endX in %, etaValue)]
+                _, posEnd, surfaceType = it
+                xEnd = round(plotLeft + (posEnd * plotWidth))
+                rectWidth = xEnd - xStart
+                # p.setBrush(self.plotUI.typo.etaData[surfaceType]['color'])
+                p.setBrush(self.plotUI.typo.etaData.get(surfaceType, {'color': Qt.transparent})['color'])
+                p.drawRect(int(xStart), int(plotTop), int(rectWidth), int(plotHeight))
+                xStart = xEnd
+            # except:
+            #     ex = "{0}".format(traceback.format_exc())
+            #     msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
+            #     print(f' renderDialogBackground {msg}')
+
         # 1) The grid (painting WITHOUT Antialiasing for 1 pixel clarity)
         p.setRenderHint(QPainter.Antialiasing, False)
         gridPen = QPen(self.plotUI.typo.gridColor, 0)  # 0 guarantees 1 physical pixel
@@ -2018,7 +2352,7 @@ class MountProfileDialog(QDialog):
                 # if textWidth + x + 3 < vSize.width():
                 p.drawLine(
                     x + indent.left,
-                    0,
+                    vSize.height() - indent.bottom + 1,
                     x + indent.left,
                     lift
                 )
@@ -2056,14 +2390,6 @@ class MountProfileDialog(QDialog):
             # print(f'viewRect = {self.viewRect}')
             # print(f'dataViewSize = {self.dataViewSize}')
             # print(f'plotPointsShare = {self.plotUI.typo.plotPointsShare}')
-
-            path = self.smartProfile.getPainterElevationProfile(
-                self.viewRect,
-                indent,
-                self.dataViewSize,
-                self.plotUI.typo.plotPointsShare,
-                self.plotUI.isAxisRatioLocked
-            )
             if not path.isEmpty():
                 self.cachedPath = path
                 p.drawPath(self.cachedPath)
@@ -2078,7 +2404,7 @@ class MountProfileDialog(QDialog):
         #     msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
         #     print(f' renderBackground {msg}')
         self.plotUI.setPosPoints(self.viewRect, self.dataViewSize)
-
+        self.plotUI.resizeSelection(self.selectionStart, self.selectionEnd, self.dataViewSize)
 
 class EditTravelerDialog(QDialog):
     def __init__(self, isCreated, travelerData, limits, parent=None):
@@ -2192,6 +2518,7 @@ class EditTravelerDialog(QDialog):
             editLine.setLayout(layout)
             limit = ''
         else:
+            editLine = QLineEdit()
             editLine = QLineEdit()
             editLine.setText(str(data['edit']))
             limit = ''
@@ -2366,10 +2693,11 @@ class InfoDisplay(QFrame):
 
 
 class ConditionsDisplay(QFrame):
-    def __init__(self, typo):
+    def __init__(self, typo, dpr):
         super().__init__()
         self.testLabel = None
         self.typo = typo
+        self.dpr = dpr
         self.setObjectName("DataPanel")
         self.setStyleSheet(self.typo.style2)
         layout = QHBoxLayout(self)
@@ -2392,20 +2720,29 @@ class ConditionsDisplay(QFrame):
             "",
             self.typo.maxTextH
         )
-        self.surfLabel = self._addBlock(
+        self.markerDict = {}
+        markerWidth = 20
+        for it in self.typo.etaData.values():
+            lbl = ColorRectLabel(markerWidth, it['color'], self.dpr, height=10)
+            self.markerDict[it['name']] = lbl
+        self.markerLayout = QVBoxLayout()
+        self.surfMarker = QLabel()
+        self.markerLayout.addWidget(self.surfMarker)
+        self.surfLabel, hBlock = self._addBlock(
             layout,
             "Surface Type",
             "",
-            self.typo.maxTextR
+            self.typo.maxTextR,
+            markerWidth=markerWidth
         )
+        hBlock.addLayout(self.markerLayout)
         layout.addStretch()
 
-    def _addBlock(self, parentLayout, title, initialValue, textSample, isHidden=False):
+    def _addBlock(self, parentLayout, title, initialValue, textSample, markerWidth=None, isHidden=False):
         container = QFrame()
         maxWidth = self.getOptimalWidth(title, self.typo.infoTitleFont, textSample, self.typo.infoValueFont)
         # if title == 'Humidity':
         #     print(f'maxWidth of Humidity field = {maxWidth}')
-        container.setFixedWidth(maxWidth)
         block = QVBoxLayout(container)
         block.setContentsMargins(0, 0, 0, 0)
         block.setSpacing(2)
@@ -2417,12 +2754,22 @@ class ConditionsDisplay(QFrame):
         vLbl = QLabel(initialValue)
         vLbl.setObjectName("Value")
         vLbl.setAlignment(Qt.AlignCenter)
-
         block.addWidget(tLbl)
-        block.addWidget(vLbl)
+        hBlock = None
+        if markerWidth is not None:
+            container.setFixedWidth(maxWidth + markerWidth)
+            hBlock = QHBoxLayout(container)
+            hBlock.setContentsMargins(3, 0, 3, 0)
+            hBlock.addWidget(vLbl)
+            block.addLayout(hBlock)
+        else:
+            container.setFixedWidth(maxWidth)
+            block.addWidget(vLbl)
         parentLayout.addWidget(container, stretch=1)
         if isHidden:
             container.setVisible(False)
+        if markerWidth is not None:
+            return vLbl, hBlock
         return vLbl
 
     def getOptimalWidth(self, title, titleFont, sampleText, valueFont):
@@ -2436,6 +2783,13 @@ class ConditionsDisplay(QFrame):
             self.tempLabel.setText(data['temperature'])
             self.humLabel.setText(data['humidity'])
             self.surfLabel.setText(data['eta'])
+            if not self.markerLayout.isEmpty():
+                self.markerLayout.removeWidget(self.surfMarker)
+                self.surfMarker.hide()
+            if data['eta'] in self.markerDict:
+                self.surfMarker = self.markerDict[data['eta']]
+                self.markerLayout.insertWidget(0, self.surfMarker)
+                self.surfMarker.show()
         except:
             # pass
             ex = "{0}".format(traceback.format_exc())
