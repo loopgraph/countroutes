@@ -4,7 +4,7 @@
    height="24"
    version="1.1"
    id="svg24"
-   sodipodi:docname="profileSettings.svg"
+   sodipodi:docname="icon_profile_settings.svg"
    inkscape:version="1.2 (dc2aedaf03, 2022-05-15)"
    xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
@@ -86,7 +86,7 @@
      inkscape:deskcolor="#d1d1d1"
      showgrid="false"
      inkscape:zoom="22.333333"
-     inkscape:cx="6.6492537"
+     inkscape:cx="1.3208955"
      inkscape:cy="12"
      inkscape:window-width="1920"
      inkscape:window-height="1046"
@@ -121,7 +121,7 @@
      id="path12" />
   <g
      id="g3200"
-     transform="matrix(0.5114795,0,0,0.49564302,11.691595,12.365732)">
+     transform="matrix(0.87177438,0,0,0.92623175,3.0307275,2.3628605)">
     <path
        d="m 10.457,1032.31 c -0.055,-0.857 0.634,-0.25 0.876,0 1.025,0.742 2.03,1.515 3.067,2.24 0.725,0.255 1.422,-0.313 1.905,-0.793 0.69,-0.772 1.365,-1.77 1.24,-2.855 -0.1,-0.55 -0.68,-0.756 -1.06,-1.087 -0.95,-0.7 -1.906,-1.394 -2.85,-2.1 0.05,-0.536 0.92,-0.43 1.352,-0.453 1.8,0.032 3.76,0.62 4.848,2.148 0.894,1.243 1.096,2.91 0.645,4.36 0.25,1.355 0.75,2.683 1.605,3.775 l -3.165,2.326 c -0.744,-0.97 -1.666,-1.812 -2.743,-2.397 -1.597,0.233 -3.23,-0.52 -4.194,-1.792 -0.762,-0.974 -1.327,-2.143 -1.526,-3.366 z"
        fill-rule="evenodd"

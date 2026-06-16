@@ -1,5 +1,5 @@
 from qgis.PyQt.QtCore import (Qt, QPointF, QRectF, QObject, QEvent, QTimer, QSize, QFileInfo, QDir, QRect,
-                              pyqtSignal, QThread, QDate, QLocale)
+                              pyqtSignal, QThread, QDate, QLocale, QPoint)
 from qgis.PyQt.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QBrush, QLinearGradient,
                              QFont, QPolygonF, QFontMetrics, QPainterPath, QPolygonF, QIcon)
 from qgis.PyQt.QtWidgets import (QWidget, QAction, QActionGroup, QGraphicsPixmapItem, QGraphicsLineItem,
@@ -29,8 +29,10 @@ import os
 import random
 import requests
 import socket
+import time
 from datetime import datetime
 import copy
+import sip
 
 pluginPath = os.path.split(os.path.dirname(__file__))[0]
 
@@ -248,6 +250,7 @@ class SmartProfile:
     altitudeSamplingStep: int = 10  # The distance step (in meters) for getting elevation data from external sources
     altitudeDelayOpenTopoData: float = 1.2  # Latency for Open Topo Data (server requires > 1 sec between requests)
     altitudeDelayUSGS: float = 0.2  # Latency for USGS API (between individual requests)
+
     def __init__(self, mbModule):
         self.x = None
         self.y = None
@@ -1123,6 +1126,7 @@ class SelectableMenuWidget(QWidget):
     deleteRequested = pyqtSignal()
     editRequested = pyqtSignal()
     selected = pyqtSignal()
+    processing = pyqtSignal()
 
     def __init__(
             self,
@@ -1130,11 +1134,12 @@ class SelectableMenuWidget(QWidget):
             parent=None,
             isEdited=False,
             isDeleted=False,
+            isProcessing=False,
             isNoButtons=False,
             isNoDotLabel=False,
-            # isMenuToBeClosed=False,
             color=None,
-            dpr=None
+            dpr=None,
+            isSelectable=True
     ):
         super().__init__(parent)
         self.setObjectName("CustomMenuWidget")
@@ -1151,48 +1156,79 @@ class SelectableMenuWidget(QWidget):
         self.label = QLabel(text)
         self.label.setObjectName("menuLabel")
 
-        if not isNoDotLabel:
-            # Отдельный лейбл для точки
-            self.dotLabel = QLabel("•")
-            self.dotLabel.setFixedWidth(15) # Фиксированная ширина резервирует место
-            self.dotLabel.setAlignment(Qt.AlignCenter)
-            self.dotLabel.setStyleSheet("color: transparent;")
-            layout.addWidget(self.dotLabel) # Точка всегда на месте
+        self.isNoDotLabel = isNoDotLabel
+        # Отдельный лейбл для точки
+        self.dotLabel = QLabel("•")
+        self.dotLabel.setFixedWidth(15) # Фиксированная ширина резервирует место
+        self.dotLabel.setAlignment(Qt.AlignCenter)
+        self.dotLabel.setStyleSheet("color: transparent;")
+        layout.addWidget(self.dotLabel) # Точка всегда на месте
 
         # Свойства для стилей
         self.setProperty("activeHover", False)
 
-        self.setStyleSheet("""
-            #CustomMenuWidget {
-                border: 2px solid transparent;
-                border-radius: 4px;
-            }
-            #CustomMenuWidget[activeHover="true"] {
-                border: 2px solid #3498db;
-                background-color: #fcfcfc;
-            }
-            #menuLabel {
-                padding-left: 5px;
-                color: #333;
-                font-weight: normal;
-            }
-        """)
+        self.isSelectable = isSelectable
+        self.setSelectable(isSelectable)
 
         layout.addWidget(self.label)
         layout.addStretch()  # Прижимаем кнопки вправо
 
+        self.editBtn = None
+        self.deleteBtn = None
+        self.processBtn = None
         if not isNoButtons:
-            self.editBtn = self.createBtn("✎", "Редактировать")
+            self.editBtn = self.createBtn("✎", "Edit")
             layout.addWidget(self.editBtn)
             self.editBtn.installEventFilter(self)
-            self.deleteBtn = self.createBtn("✕", "Удалить")
+            self.deleteBtn = self.createBtn("✕", "Delete")
             layout.addWidget(self.deleteBtn)
             self.deleteBtn.installEventFilter(self)
             self.setButtonsVisible(isEdited, isDeleted)
 
+        self.progress = 0
+        self.spinner = None
+        self.processBtn = None
+        if isProcessing:
+            self.spinner = LoadingSpinner(self, speed=60, color=QColor("teal"))
+            if dpr is None: dpr = 1.0
+            self.processBtn = ProcessButton('▶', '✔', self.spinner, self.label.font(), dpr)
+            layout.addWidget(self.processBtn)
+            self.processBtn.installEventFilter(self)
+
         if color is not None and dpr is not None:
             widget = ColorRectLabel(20, color, dpr)
             layout.addWidget(widget)
+
+    def setSelectable(self, isSelectable):
+        self.isSelectable = isSelectable
+        if isSelectable:
+            self.setStyleSheet("""
+                #CustomMenuWidget {
+                    border: 2px solid transparent;
+                    border-radius: 4px;
+                }
+                #CustomMenuWidget[activeHover="true"] {
+                    border: 2px solid #3498db;
+                    background-color: #fcfcfc;
+                }
+                #menuLabel {
+                    padding-left: 5px;
+                    color: #333;
+                    font-weight: normal;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                #CustomMenuWidget {
+                    border: 2px solid transparent;
+                    border-radius: 4px;
+                }
+                #menuLabel {
+                    padding-left: 5px;
+                    color: #333;
+                    font-weight: normal;
+                }
+            """)
 
     def setButtonsVisible(self, isEdited, isDeleted):
         self.editBtn.setVisible(isEdited)
@@ -1207,21 +1243,31 @@ class SelectableMenuWidget(QWidget):
         spDeleteBtn.setRetainSizeWhenHidden(True)
         self.deleteBtn.setSizePolicy(spDeleteBtn)
 
-    def createBtn(self, text, tooltip):
+    def createBtn(self, text, tooltip, isBorder=False):
         btn = QToolButton()
         textHeight = self.label.fontMetrics().height()
         btnSize = textHeight
-        btn.setText(text)
+        if text: btn.setText(text)
         btn.setToolTip(tooltip)
         btn.setFixedSize(btnSize, btnSize)
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setStyleSheet("""
-            QToolButton { border: none; background: transparent; border-radius: 4px; color: gray; }
-            QToolButton:hover { background-color: rgba(0, 0, 0, 0.1); color: black; }
+        if isBorder:
+            btn.setStyleSheet("""
+            QToolButton { border: 1px solid green; background-color: #98FB98; border-radius: 2px; color: green; }
+            QToolButton:hover { background-color: green; color: white; }
         """)
+        else:
+            btn.setStyleSheet("""
+                QToolButton { border: none; background: transparent; border-radius: 4px; color: gray; }
+                QToolButton:hover { background-color: rgba(0, 0, 0, 0.1); color: black; }
+            """)
         return btn
 
+    def setDotable(self, isDotable):
+        self.isNoDotLabel = not isDotable
+
     def setSelected(self, isSelected: bool):
+        if self.isNoDotLabel or not self.isSelectable: return False
         if isSelected:
             self.dotLabel.setStyleSheet("color: #333; font-weight: bold;")
             # self.dotLabel.setStyleSheet("color: #3498db; font-weight: bold;")
@@ -1236,6 +1282,7 @@ class SelectableMenuWidget(QWidget):
         # else:
         #     self.label.setText(self.originalText)
         #     self.label.setStyleSheet("font-weight: normal; color: #333;")
+        return True
 
     def paintEvent(self, event):
         # Это "магический" код, включающий поддержку QSS для кастомного QWidget
@@ -1266,7 +1313,13 @@ class SelectableMenuWidget(QWidget):
                 # not self.isMenuToBeClosed
         ):
             if obj == self.editBtn: self.editRequested.emit()
-            if obj == self.delBtn: self.deleteRequested.emit()
+            if obj == self.deleteBtn: self.deleteRequested.emit()
+            if obj == self.processBtn and self.processBtn.isEnabled():
+                if not self.processBtn.isLoading:
+                    self.processBtn.startLoading()
+                    self.processing.emit()
+                else:
+                    self.processBtn.stopLoading()
             return True  # Сообщаем QMenu, что событие обработано и закрываться не нужно
         return super().eventFilter(obj, event)
 
@@ -1275,14 +1328,206 @@ class SelectableMenuWidget(QWidget):
             self.selected.emit()
 
 
+class LoadingSpinner(QWidget):
+
+    def __init__(self, parent=None, speed=60, color=QColor(0, 120, 215)):
+        super().__init__(parent)
+        self.angle = 0
+        self.color = color
+        self.speed = speed
+
+        # Таймер для обновления анимации
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.rotate)
+        # self.timer.start(speed)  # Скорость обновления в миллисекундах
+
+    def rotate(self):
+        # Поворачиваем индикатор на 30 градусов за шаг
+        self.angle = (self.angle + 30) % 360
+        if self.parent():
+            self.parent().update()
+        else:
+            self.update()
+
+    def start(self):
+        if not self.timer.isActive():
+            self.timer.start(self.speed)
+            self.show()
+
+    def stop(self):
+        self.timer.stop()
+        self.hide()
+
+    def paintEvent(self, event, external_painter=None):
+
+        if external_painter is None:
+            return
+        painter = external_painter
+        # if external_painter is not None:
+        #     painter = external_painter
+        # else:
+        #     painter = QPainter(self)
+        #     painter.setRenderHint(QPainter.Antialiasing, True)   # Включаем сглаживание
+
+        # Сдвигаем центр координат в середину виджета
+        width = self.width()
+        height = self.height()
+        side = min(width, height)
+        painter.translate(width / 2, height / 2)
+
+        # Вычисляем пропорциональные размеры линий
+        ray_length = side * 0.25
+        ray_width = max(2, int(side * 0.05))
+        inner_radius = side * 0.20
+
+        # Настраиваем кисть для рисования линий
+        pen = QPen()
+        pen.setWidth(ray_width)
+        pen.setCapStyle(Qt.RoundCap)  # Скругленные края линий
+
+        # Поворачиваем холст на текущий угол анимации
+        painter.rotate(self.angle)
+
+        # Рисуем 12 лучей с разной прозрачностью для эффекта затухания
+        for i in range(12):
+            # Рассчитываем прозрачность: первый луч самый яркий, остальные затухают
+            alpha = int(255 * (i / 12))
+            self.color.setAlpha(alpha)
+            pen.setColor(self.color)
+            painter.setPen(pen)
+
+            # Рисуем один луч
+            painter.drawLine(0, int(inner_radius), 0, int(inner_radius + ray_length))
+            # Поворачиваем холст для следующего луча (360 / 12 = 30 градусов)
+            painter.rotate(30)
+        if external_painter is None:
+            painter.end()
+
+
+class ProcessButton(QToolButton):
+    def __init__(self, startText, finishText, spinnerWidget, targetFont, dpr, parent=None):
+        super().__init__(parent)
+        self.startText = startText
+        self.finishText = finishText
+        # Расчет 1 физического пикселя в логических координатах QPainter
+        self.pixelOffset = 1.0 / dpr
+        self.setText(startText)
+        # QToolButton { border: 1px solid green; background-color: #98FB98; border-radius: 2px; color: green; }
+        self.setStyleSheet("""
+            QToolButton { border: 1px solid green; border-radius: 2px; color: green; }
+            QToolButton:hover { background-color: #98FB98; color: green; }
+        """)
+
+        # Сохраняем ссылку на ваш спиннер и делаем кнопку его родителем
+        self.spinner = spinnerWidget
+        self.spinner.setParent(self)
+
+        # Скрываем сам виджет спиннера, чтобы он не перекрывал кнопку физически.
+        # Мы будем использовать только его логику отрисовки.
+        self.spinner.hide()
+
+        # Настройки состояния
+        self.progress = 0  # Текущий процент (0-100)
+        self.isLoading = False  # Флаг: идет загрузка или нет
+
+        # Устанавливаем кнопке тот же шрифт, что и у соседнего заголовка
+        self.setFont(targetFont)
+
+        # Расчет и фиксация размеров кнопки
+        self.fixSizes(targetFont)
+
+    def fixSizes(self, font):
+        fm = QFontMetrics(font)
+
+        # 1. Получаем чистую высоту шрифта (font_height)
+        font_height = fm.height()
+
+        # 2. Спиннер делаем строго квадратным, равным высоте шрифта
+        spinner_size = font_height
+        self.spinner.setFixedSize(spinner_size, spinner_size)
+
+        # 3. Высота кнопки: строго размер спиннера + 2 пикселя (по 1px сверху и снизу)
+        button_height = spinner_size + 2
+
+        # 4. Расчет ширины: ширина текста " 000 % "
+        text_width = fm.horizontalAdvance(" 000 % ")
+
+        # Итоговая ширина кнопки:
+        # 1px (слева) + спиннер + 2px (зазор между спиннером и текстом) + текст + 1px (справа для симметрии)
+        button_width = 1 + spinner_size + 2 + text_width + 1
+
+        # Жестко фиксируем размеры кнопки
+        self.setFixedSize(button_width, button_height)
+
+    def startLoading(self):
+        """Вызывать для старта анимации"""
+        self.isLoading = True
+        self.setText("")  # Скрываем символ "▶"
+        self.progress = 0
+        self.spinner.start()  # Метод запуска таймера
+        print('Spinner was started...')
+        self.update()
+
+    def setProgress(self, value):
+        """Вызывать для обновления процентов (0-100)"""
+        self.progress = max(0, min(100, value))
+        print(f'ProcessButton progress = {self.progress}')
+        self.update()
+
+    def stopLoading(self):
+        """Вызывать для завершения анимации"""
+        self.isLoading = False
+        self.spinner.stop()  # Метод остановки таймера
+        print('Spinner was stopped.')
+        self.setText(self.finishText)
+        self.setEnabled(False)
+        self.update()
+
+    def paintEvent(self, event):
+        # 1. Отрисовка подложки кнопки
+        super().paintEvent(event)
+
+        if self.isLoading:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # --- ОТРИСОВКА СПИННЕРА (СТРОГО 1px СВЕРХУ И СЛЕВА) ---
+            spinner_x = 1
+            spinner_y = 1  # Так как высота кнопки = spinner_height + 2, отступ снизу тоже станет ровно 1px
+
+            painter.save()
+            painter.translate(spinner_x, spinner_y)
+            # Передаем управление вашему спиннеру
+            self.spinner.paintEvent(event, external_painter=painter)
+            painter.restore()
+
+            # --- ОТРИСОВКА ПРОЦЕНТОВ ---
+            progress_text = f" {self.progress:02d} %"
+
+            painter.setPen(self.palette().color(self.foregroundRole()))
+            painter.setFont(self.font())
+
+            # Текст начинается после спиннера и небольшого зазора в 2px
+            text_x = spinner_x + self.spinner.width() + 2
+
+            # Точное выравнивание текста по вертикали, чтобы буквы стояли ровно по центру кнопки
+            fm = QFontMetrics(self.font())
+            text_y = (self.height() - fm.height()) // 2 + fm.ascent()
+
+            painter.drawText(int(text_x), int(text_y), progress_text)
+            painter.end()
+
+
 class ColorRectLabel(QLabel):
-    def __init__(self, width, color, dpr, height=20):
+    def __init__(self, width, color, dpr, height=20, text='', textColor=Qt.transparent):
         super().__init__()
         self.setFixedWidth(width)
         self.setStyleSheet("border: none; background: transparent; padding: 0px; margin: 0px;")
         self.rectColor = color
         self.rectWidth = width
         self.dpr = dpr
+        self.charText = text
+        self.charColor = textColor
         self.generatePixmap(height)
 
     def generatePixmap(self, h):
@@ -1297,6 +1542,23 @@ class ColorRectLabel(QLabel):
         painter.setPen(QPen(Qt.darkGray, 0))
         painter.setBrush(QColor(self.rectColor))
         painter.drawRect(0, 0, w - 1, h - 1)
+        if self.charText:
+            # Настраиваем шрифт для символа
+            font = painter.font()
+            # При необходимости здесь можно изменить размер: font.setPointSize(12)
+            painter.setFont(font)
+            painter.setPen(self.charColor)
+            # Включаем антиалиасинг для текста, чтобы он был гладким
+            painter.setRenderHint(QPainter.TextAntialiasing, True)
+            # Вычисляем координаты для точного центрирования
+            fm = QFontMetrics(font)
+            textWidth = fm.horizontalAdvance(self.charText)
+            textHeight = fm.height()
+            # Формула учитывает базовую линию шрифта (ascent)
+            x = (w - textWidth) // 2
+            y = (h - textHeight) // 2 + fm.ascent()
+            # Рисуем символ
+            painter.drawText(x, y, self.charText)
         painter.end()
         self.setPixmap(QPixmap.fromImage(buffer))
 
@@ -1394,7 +1656,6 @@ class MyPlotDock(QgsDockWidget):
         icon = QIcon(iconPath)
         self.btnBodyMetrics.setIcon(icon)
         self.btnBodyMetrics.setPopupMode(QToolButton.InstantPopup)
-
         self.travelerMenu = QMenu(self)
         self.travelerSeparator = self.travelerMenu.addSeparator()
         # actionCreateTraveler = QAction("Create Traveler . . .", self.travelerMenu)
@@ -1420,7 +1681,6 @@ class MyPlotDock(QgsDockWidget):
         else:
             widget = self.travelerActionGroup[f'{self.travelerDefaultId}'].defaultWidget()
         widget.setSelected(True)
-
         self.btnBodyMetrics.setMenu(self.travelerMenu)
         self.btnBodyMetrics.setEnabled(True)
         toolBar.addWidget(self.btnBodyMetrics)
@@ -1955,7 +2215,7 @@ class MyPlotDock(QgsDockWidget):
 class MountProfileDialog(QDialog):
     def __init__(self, smartProfile, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Temperature, humidity and surface type")
+        self.setWindowTitle("Changing profile, temperature, humidity and surface type")
         # self.resize(300, 400)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.canvas = QgsPlotCanvas()
@@ -2005,6 +2265,43 @@ class MountProfileDialog(QDialog):
         self.actionZoomFull.setEnabled(False)
         self.actionZoomFull.triggered.connect(self.zoomFull)
         toolBar.addAction(self.actionZoomFull)
+
+        profileChoice = QToolButton()
+        profileChoice.setAutoRaise(True)
+        profileChoice.setToolTip("Profile Choice")
+        iconPath = os.path.join(pluginPath, '', 'countroutes/img', 'icon_profile_choice.svg')
+        icon = QIcon(iconPath)
+        profileChoice.setIcon(icon)
+        profileChoice.setPopupMode(QToolButton.InstantPopup)
+        self.profileChoiceMenu = QMenu(self)
+        action = self.addProfileAction(
+            self.profileChoiceMenu,
+            'Embedded Profile',
+            'embedded',
+            self.selectProfile,
+            isNoDotLabel=False,
+            isNoButtons=True
+        )
+        self.currentProfileAction = action
+        action.defaultWidget().setSelected(True)
+        self.profileChoiceMenu.addAction(action)
+        action = self.addProfileAction(
+            self.profileChoiceMenu,
+            'External Profile',
+            'external',
+            self.selectProfile,
+            isNoDotLabel=False,
+            isNoButtons=True,
+            isProcessing=True,
+            dpr=self.getDPR(),
+            isSelectable=False
+        )
+        widget = action.defaultWidget()
+        widget.processing.connect(lambda: self.runLoadingProfileData(widget))
+        self.profileChoiceMenu.addAction(action)
+        profileChoice.setMenu(self.profileChoiceMenu)
+        profileChoice.setEnabled(True)
+        toolBar.addWidget(profileChoice)
 
         self.setStyleSheet(self.plotUI.typo.style2)
         layout = QVBoxLayout(self)
@@ -2110,9 +2407,70 @@ class MountProfileDialog(QDialog):
         self.timerUpdateData.timeout.connect(self.updateDataSpline)
         self.dataToUpdate = {}
 
+        self.thread = None
+        self.worker = None
+
+    def runLoadingProfileData(self, widget):
+        print('Checking for internet connectivity ...')
+        if not self.isInternetAvailable():
+            print('Internet is not available')
+            return
+        self.thread = QThread()
+        self.worker = AltitudeDataWorker(self.smartProfile.altitudePoints, 10)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        # self.worker.finished.connect(self.loadingNASADone)
+        self.worker.close.connect(self.thread.quit)
+        self.worker.close.connect(widget.processBtn.stopLoading)
+        self.worker.close.connect(lambda: widget.setSelectable(True))
+        self.worker.error.connect(lambda e: iface.messageBar().pushMessage("Error", e, level=2))
+        self.worker.progress.connect(lambda v: widget.processBtn.setProgress(v))
+        # self.worker.feedback.connect(lambda m: self.feedbackInfo.setText(m))
+        print('Elevations Loading request starting ...')
+        self.thread.start()
+
+    @staticmethod
+    def isInternetAvailable(host="8.8.8.8", port=53, timeout=7):
+        """
+        Checks for internet connectivity by attempting a low-level connection.
+        8.8.8.8 — Google DNS. Can be changed to power.larc.nasa.gov
+        """
+        try:
+            socket.setdefaulttimeout(timeout)
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+            return True
+        except socket.error:
+            return False
+
     def getDPR(self):
         viewport = self.canvas.viewport()
         return viewport.devicePixelRatioF()
+
+    @staticmethod
+    def raster_fully_covers_route(raster_layer, route_linestring):
+        """
+        Проверяет, что маршрут (QgsLineString) ПОЛНОСТЬЮ лежит
+        внутри границ растра (QgsRasterLayer).
+        """
+        # 1. Получаем охват растра и превращаем его в полигон геометрии
+        raster_extent = raster_layer.extent()
+        raster_poly_geom = QgsGeometry.fromRect(raster_extent)
+
+        # 2. Создаем геометрию из линии маршрута
+        route_geom = QgsGeometry(route_linestring)
+
+        # 3. Приведение к единой системе координат (СК)
+        # Переводим линию в СК растра (это точнее, так как DIM-файлы используют метрическую UTM)
+        project_crs = QgsProject.instance().crs()
+        raster_crs = raster_layer.crs()
+
+        if project_crs != raster_crs:
+            transform = QgsCoordinateTransform(project_crs, raster_crs, QgsProject.instance())
+            route_geom.transform(transform)
+
+        # 4. Строгая проверка на полное вхождение
+        # contains() возвращает True только если ВСЯ линия лежит внутри полигона растра
+        return raster_poly_geom.contains(route_geom)
 
     def addEtaType(self, name, color):
         action = QWidgetAction(self.etaMenu)
@@ -2149,13 +2507,38 @@ class MountProfileDialog(QDialog):
                  "Please select an area using the mouse with the left button pressed.")
             )
 
-    @staticmethod
-    def addSimpleAction(menu, name, actName, actionMethod, isNoDotLabel=True, isNoButtons=True):
+    def selectProfile(self, action):
+        if (
+                self.currentProfileAction.objectName() != action.objectName() and
+                action.defaultWidget().setSelected(True)
+        ):
+            self.currentProfileAction.defaultWidget().setSelected(False)
+            self.currentProfileAction = action
+
+    def addProfileAction(
+            self,
+            menu,
+            name,
+            actName,
+            actionMethod,
+            isNoDotLabel=True,
+            isNoButtons=True,
+            isProcessing=False,
+            dpr=None,
+            isSelectable=True
+    ):
         action = QWidgetAction(menu)
-        widget = SelectableMenuWidget(name, isNoDotLabel=isNoDotLabel, isNoButtons=isNoButtons)
+        widget = SelectableMenuWidget(
+            name,
+            isNoDotLabel=isNoDotLabel,
+            isNoButtons=isNoButtons,
+            isProcessing=isProcessing,
+            dpr=dpr,
+            isSelectable=isSelectable
+        )
         action.setDefaultWidget(widget)
         action.setObjectName(actName)
-        widget.selected.connect(actionMethod)
+        widget.selected.connect(lambda: actionMethod(action))
         return action
 
     def setSelection(self, xStart, xEnd):
@@ -2216,7 +2599,7 @@ class MountProfileDialog(QDialog):
                 self.dataToUpdate['humidity'].append(
                     {'distance': dL[idx], 'value': edit['rh'].value() / 100}
                 )
-        elif flag == 'manualTemp'  and self.selectDataGroup.checkedId() == 1:
+        elif flag == 'manualTemp' and self.selectDataGroup.checkedId() == 1:
             self.dataToUpdate = {'temperature': []}
             edits = self.pointsConditions.editsManual
             for idx, edit in enumerate(edits):
@@ -2405,6 +2788,7 @@ class MountProfileDialog(QDialog):
         #     print(f' renderBackground {msg}')
         self.plotUI.setPosPoints(self.viewRect, self.dataViewSize)
         self.plotUI.resizeSelection(self.selectionStart, self.selectionEnd, self.dataViewSize)
+
 
 class EditTravelerDialog(QDialog):
     def __init__(self, isCreated, travelerData, limits, parent=None):
@@ -3171,6 +3555,117 @@ class NASADataWorker(QObject):
             self.progress.emit(0)
         self.isBroken = False
         print('close.emit')
+        self.close.emit()
+
+
+class AltitudeDataWorker(QObject):
+    DELAY_OPENTOPO = 1.2  # Задержка для Open Topo Data (сервер требует > 1 сек между запросами)
+    DELAY_USGS = 0.2  # Задержка для USGS API (между поштучными запросами)
+    MAX_POINTS_OPENTOPO = 100  # Лимит точек на один пакет в Open Topo Data
+    finished = pyqtSignal(list)
+    progress = pyqtSignal(int)
+    feedback = pyqtSignal(str)
+    error = pyqtSignal(str)
+    close = pyqtSignal()
+
+    def __init__(self, altitudePoints, progressValue=0):
+        super().__init__()
+        self.isBroken = False
+        # [{"lat": ptWGS84.y(), "lon": ptWGS84.x(), "dist": float(x), "elev": None}]
+        self.altitudePoints = altitudePoints
+        self.progressValue = progressValue
+
+    """
+    Полная схема сборки URL-адреса:
+    Вот что записывается в строку шаг за шагом:
+    1) https://api. — сначала обязательно добавьте поддомен api. перед названием сайта, 
+        чтобы получилось https://api.opentopodata.org.
+    2) /v1/ — версия API (пишется через слэши).
+    3) srtm30m — точное название выбранного датасета рельефа.
+    4) ?locations= — знак вопроса и имя параметра для координат.
+    6) Широта1,Долгота1 — координаты первой точки через запятую (без пробелов).
+    7) | — вертикальный разделитель точек.
+    8) Широта2,Долгота2 — координаты второй точки через запятую.
+    """
+    def query_open_topo_data(self, chunk_points):
+        """ Запрос пакета точек (до 100 шт) через Open Topo Data """
+        payload_str = "|".join([f"{p['lat']:.6f},{p['lon']:.6f}" for p in chunk_points])
+        url = f"https://api.opentopodata.org/v1/srtm30m?locations={payload_str}"
+        # url = f"https://opentopodata.org{payload_str}"
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            if resp.status_code == 200:
+                results = resp.json()['results']
+                for idx, res in enumerate(results):
+                    chunk_points[idx]['elev'] = res['elevation']
+                return True
+        except requests.exceptions.Timeout:
+            print("Сервер отвечал слишком долго!")
+        except requests.exceptions.HTTPError as err:
+            print(f"Ошибка сервера: {err}")
+        return False
+
+    """
+    Полная схема сборки 
+    url = "https://api.open-elevation.com/api/v1/lookup?locations=55.7558,37.6173"
+    url = "https://elevation-api.open-meteo.com/v1/elevation?latitude=55.7558,54.1931&longitude=37.6173,37.6173"
+    """
+    def query_usgs_point(self, point_dict):
+        """ Запрос одной точки через USGS EPQS API """
+        url = f"https://nationalmap.gov{point_dict['lon']:.6f}&y={point_dict['lat']:.6f}&units=Meters&output=json"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                elevation = data['USGS_Elevation_Point_Query_Service']['Elevation_Query']['Elevation']
+                # USGS возвращает -1000000, если данные на эту точку отсутствуют
+                if elevation > -1000:
+                    point_dict['elev'] = elevation
+                    return True
+        except Exception:
+            self.error.emit()
+        return False
+
+    def run(self):
+        totalPoints = len(self.altitudePoints)
+        i = 0
+        currentProgressValue = self.progressValue
+        progressDelta = (100 - self.progressValue) / (totalPoints)
+        while i < totalPoints:
+            chunk = self.altitudePoints[
+                    i:  i + self.MAX_POINTS_OPENTOPO]
+            print(f"Запрос [{i}-{i + len(chunk)}] через приоритетный Open Topo Data...")
+
+            # Попытка 1: Используем Open Topo Data (Пакетный режим)
+            success = self.query_open_topo_data(chunk)
+            # success = False
+            if success and not self.isBroken:
+                print(f"-> Успешно получено {len(chunk)} точек.")
+                i += len(chunk)
+                time.sleep(self.DELAY_OPENTOPO)  # Задержка для Open Topo Data
+                currentProgressValue += int(round(progressDelta * len(chunk)))
+                self.progress.emit(currentProgressValue)
+            else:
+                # Попытка 2: Резервный режим. Если пакет упал, обрабатываем эти же точки по одной через USGS
+                print("⚠️ Open Topo Data недоступен или выдал ошибку. Переключение на резервный USGS API...")
+                # for pt in chunk:
+                #     print(f"   Запрос точки {pt['dist']:.1f} м через USGS...")
+                #     usgs_success = self.query_usgs_point(pt)
+                #     if not usgs_success:
+                #         pt['elev'] = "Ошибка_данных"
+                #     time.sleep(self.DELAY_USGS)  # Задержка между поштучными запросами USGS
+
+                i += len(chunk)  # Сдвигаем индекс после обработки всей резервной пачки
+
+        # === ВЫВОД РЕЗУЛЬТАТОВ ===
+        print("\n" + "=" * 60)
+        print("ВЫГРУЗКА ВЫСОТ NASA ЗАВЕРШЕНА!")
+        print("Дистанция(м)\tШирота(Lat)\tДолгота(Lon)\tВысота(м)")
+        print("=" * 60)
+        for pt in self.altitudePoints:
+            elev_str = f"{pt['elev']:.2f}" if isinstance(pt['elev'], (int, float)) else str(pt['elev'])
+            print(f"{pt['dist']:.1f}\t{pt['lat']:.6f}\t{pt['lon']:.6f}\t{elev_str}")
         self.close.emit()
 
 
