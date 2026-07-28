@@ -1,7 +1,7 @@
 from qgis.PyQt.QtCore import (Qt, QPointF, QRectF, QObject, QEvent, QTimer, QSize, QFileInfo, QDir, QRect,
                               pyqtSignal, QThread, QDate, QLocale, QPoint)
 from qgis.PyQt.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QBrush, QLinearGradient,
-                             QFont, QPolygonF, QFontMetrics, QPainterPath, QPolygonF, QIcon)
+                             QFont, QFontMetrics, QPainterPath, QPolygonF, QIcon)
 from qgis.PyQt.QtWidgets import (QWidget, QAction, QActionGroup, QGraphicsPixmapItem, QGraphicsLineItem,
                                  QGraphicsSimpleTextItem, QApplication, QToolBar, QMenu, QStyleOption, QStyle,
                                  QVBoxLayout, QFileDialog, QMessageBox, QToolButton, QDialog, QWidgetAction,
@@ -11,7 +11,6 @@ from qgis.PyQt.QtWidgets import (QWidget, QAction, QActionGroup, QGraphicsPixmap
                                  QGraphicsEllipseItem, QGraphicsItem, QGraphicsRectItem)
 import numpy as np
 from scipy.interpolate import CubicSpline, UnivariateSpline, interp1d
-from scipy.signal import savgol_filter
 import math
 from qgis.gui import (QgsPlotCanvas, QgsDockWidget, QgsRubberBand,
                       QgsMapLayerComboBox)
@@ -23,13 +22,17 @@ from qgis.core import (QgsApplication, QgsSettings, QgsVectorLayer, QgsCoordinat
 from qgis.utils import iface
 from dataclasses import dataclass, field
 from qgis import processing
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 import traceback
 import os
 import random
 import requests
+import uuid
 import socket
 import time
+import pyproj
+from osgeo import ogr
+
 from datetime import datetime
 import copy
 import sip
@@ -56,7 +59,8 @@ class Typography:
     maxTextR: str = "asphalt"
     distanceTextFormatInfo: str = "{: 6.2f} m"
     elevationTextFormatInfo: str = "{: 7.2f} m"
-    gradientTextFormatInfo: str = "{: 2.2f} °"
+    gradientDTextFormatInfo: str = "{: 2.2f} °"
+    gradientPTextFormatInfo: str = "{: 2.2f} %"
     energyTextFormatInfo: str = "{: 8.2f} kcal"
     glycogenTextFormatInfo: str = "{: 4.2f} kcal"
     fluidTextFormatInfo: str = "{: 4.2f} ml"
@@ -246,6 +250,456 @@ class Typography:
         }
 
 
+class NameManager:
+    def __init__(self, initialDict=None):
+        """
+        Инициализация класса. Принимает необязательный список строк.
+        Если во входном списке есть полные дубликаты, они переименуются по правилу 'Имя(1)(1)'.
+        """
+        self.resultDict = {}
+        self.nameRegistry = {}  # { 'Чистое Имя': {занятые_номера} }
+
+        if initialDict:
+            for key, item in initialDict.items():
+                cleanedItem = self._clean(item)
+                if not cleanedItem:
+                    continue
+
+                # Если такое имя (вместе со всеми его текущими скобками) уже есть в результате
+                if cleanedItem in self.resultDict.values():
+                    # Добавляем его как абсолютно новую сущность.
+                    # addName сам распарсит 'Иван(1)' как базовое имя и добавит к нему (1) -> 'Иван(1)(1)'
+                    self.addName(cleanedItem, key)
+                else:
+                    # Если имени еще нет в результате, парсим его стандартным путем
+                    cleanName, suffixNum = self._parseFormattedName(cleanedItem)
+
+                    if cleanName not in self.nameRegistry:
+                        self.nameRegistry[cleanName] = set()
+
+                    self.nameRegistry[cleanName].add(suffixNum)
+                    self.resultDict[key] = cleanedItem
+
+    def getNames(self):
+        return self.resultDict
+
+    def _clean(self, name):
+        return " ".join(name.split())
+
+    def _parseFormattedName(self, formattedName):
+        """Разбивает строку типа 'Иван(2)' на чистую часть 'Иван' и число 2."""
+        if formattedName.endswith(")") and "(" in formattedName:
+            base, suffix = formattedName.rsplit("(", 1)
+            suffixNum = suffix[:-1]
+            if suffixNum.isdigit():
+                return base, int(suffixNum)
+        return formattedName, 0
+
+    def addName(self, cleanedName, key, noName='NoName'):
+        cleanedName = self._clean(cleanedName)
+        if not cleanedName and noName:
+            cleanedName = noName
+        elif not cleanedName:
+            return None
+
+        # Если имя встретилось впервые, создаем для него пустое множество
+        if cleanedName not in self.nameRegistry:
+            self.nameRegistry[cleanedName] = set()
+
+        # Ищем минимальный свободный номер в словаре (без сканирования списка!)
+        busyNumbers = self.nameRegistry[cleanedName]
+        suffixNum = 0
+        while suffixNum in busyNumbers:
+            suffixNum += 1
+
+        # Регистрируем номер как занятый
+        busyNumbers.add(suffixNum)
+
+        # Формируем имя
+        formattedName = cleanedName if suffixNum == 0 else f"{cleanedName}({suffixNum})"
+        self.resultDict[key] = formattedName
+        return formattedName
+
+    def removeName(self, key):
+        if key not in self.resultDict:
+            # print(f"Ошибка: Ключ '{key}' не найден.")
+            return False
+        formattedName = self.resultDict[key]
+        del self.resultDict[key]
+        # Удаляем из основного списка
+
+        # Парсим имя, чтобы узнать, какой номер освободился в словаре
+        cleanName, suffixNum = self._parseFormattedName(formattedName)
+
+        # Освобождаем номер в словаре
+        if cleanName in self.nameRegistry:
+            self.nameRegistry[cleanName].discard(suffixNum)
+            # Если номеров больше нет, чистим словарь, чтобы не копился мусор
+            if not self.nameRegistry[cleanName]:
+                del self.nameRegistry[cleanName]
+        return True
+
+    def editName(self, oldFormattedName, newName, key, noName='NoName'):
+        if key not in self.resultDict:
+            print(f"Ошибка: Ключ '{key}' не найден.")
+            return False
+
+        cleanedNewName = self._clean(newName)
+        if not cleanedNewName and noName:
+            cleanedNewName = noName
+        elif not cleanedNewName:
+            return False
+
+        oldCleanedName, oldSuffixNum = self._parseFormattedName(oldFormattedName)
+        self.nameRegistry[oldCleanedName].discard(oldSuffixNum)
+
+        # 2. Ищем свободный номер для нового имени в словаре
+        if cleanedNewName not in self.nameRegistry:
+            self.nameRegistry[cleanedNewName] = set()
+
+        busyNumbers = self.nameRegistry[cleanedNewName]
+        newSuffixNum = 0
+        while newSuffixNum in busyNumbers:
+            newSuffixNum += 1
+
+        # 3. Фиксируем новый номер и обновляем список на том же месте
+        busyNumbers.add(newSuffixNum)
+        formattedNewName = cleanedNewName if newSuffixNum == 0 else f"{cleanedNewName}({newSuffixNum})"
+
+        self.resultDict[key] = formattedNewName
+        return True
+
+
+class BodyMetrics:
+    def __init__(self, mbModule, settings):
+        self.settings = settings
+        self.defaultId = 0
+        self.bodyMetricsPath = 'Plugins/countRoutesTravelerBioMetrics'
+        defaultBodyMetrics = {
+            self.defaultId: {
+                "name": 'NoName (default)',
+                "gender": False,    # Male - False
+                "age": int(40),
+                "weight": float(80),
+                "height": int(180),
+                "speed": float(5),
+                "cargo": float(0)
+            }
+        }
+        self.bodyMetricsData = self.settings.value(
+            self.bodyMetricsPath,
+            defaultBodyMetrics
+        )
+        initialNames = {key: it['name'] for key, it in self.bodyMetricsData.items()}
+        self.names = NameManager(initialNames)
+        for key, name in self.names.getNames().items():
+            self.bodyMetricsData[key]['name'] = name
+        self.lastActiveBodyMetricsPath = 'Plugins/countRoutesLastActiveTraveler'
+        self.lastActiveBodyMetricsKey = self.settings.value(
+            self.lastActiveBodyMetricsPath,
+            self.defaultId
+        )
+        self.bodyMetricsLimits = {
+            'age': mbModule.AGE_LIMIT,
+            'weight': mbModule.WEIGHT_LIMIT,
+            'height': mbModule.HEIGHT_LIMIT,
+            'speed': (
+                (int((mbModule.SPEED_LIMIT[0] * 3.6) * 100)) / 100,
+                int((mbModule.SPEED_LIMIT[1] * 3.6) * 100) / 100
+            ),
+            'cargo': mbModule.PACK_LIMIT
+        }
+
+    def isDefaultId(self, key):
+        return key == self.defaultId
+
+    def getLimits(self):
+        return self.bodyMetricsLimits
+
+    def getKeys(self):
+        return [k for k in self.bodyMetricsData]
+
+    def getData(self, key):
+        return self.bodyMetricsData[key] if key in self.bodyMetricsData else None
+
+    def getCurrentData(self):
+        return self.bodyMetricsData[self.lastActiveBodyMetricsKey]
+
+    def getCurrentKey(self):
+        return self.lastActiveBodyMetricsKey
+
+    def setCurrentData(self, bodyMetricsKey):
+        if bodyMetricsKey != self.lastActiveBodyMetricsKey and bodyMetricsKey in self.bodyMetricsData:
+            self.lastActiveBodyMetricsKey = bodyMetricsKey
+
+    def createData(self, data):
+        if self.isBodyMetricsAvailable(data):
+            bodyMetricsKey = uuid.uuid4().hex
+            data['name'] = self.names.addName(data['name'], bodyMetricsKey)
+            if not data['name']:
+                return None
+            self.bodyMetricsData[bodyMetricsKey] = data
+            return bodyMetricsKey
+        return None
+
+    def isBodyMetricsAvailable(self, data):
+        keys = ["name", "gender", "age", "weight", "height", "speed", "cargo"]
+        if not isinstance(data, dict) or not all(k in keys for k in data):
+            return False
+        return (
+            isinstance(data['name'], str) and
+            isinstance(data['gender'], bool) and
+            isinstance(data['age'], (int, float)) and
+            isinstance(data['weight'], (int, float)) and
+            isinstance(data['height'], (int, float)) and
+            isinstance(data['speed'], (int, float)) and
+            isinstance(data['cargo'], (int, float)) and
+            self.bodyMetricsLimits['age'][0] >= int(data['age']) >= self.bodyMetricsLimits['age'][1] and
+            self.bodyMetricsLimits['weight'][0] >= float(data['weight']) >= self.bodyMetricsLimits['weight'][1] and
+            self.bodyMetricsLimits['height'][0] >= int(data['height']) >= self.bodyMetricsLimits['height'][1] and
+            self.bodyMetricsLimits['speed'][0] >= float(data['speed']) >= self.bodyMetricsLimits['speed'][1] and
+            self.bodyMetricsLimits['cargo'][0] >= float(data['cargo']) >= self.bodyMetricsLimits['cargo'][1]
+        )
+
+    def editData(self, bodyMetricsKey, data):
+        if not bodyMetricsKey in self.bodyMetricsData:
+            return False
+        if self.isBodyMetricsAvailable(data):
+            if self.names.editName(self.bodyMetricsData[bodyMetricsKey]['name'], data['name'], bodyMetricsKey):
+                data['name'] = self.names.getNames()[bodyMetricsKey]
+                self.bodyMetricsData[bodyMetricsKey] = data
+                return True
+        return False
+
+    def removeData(self, bodyMetricsKey):
+        if bodyMetricsKey in self.bodyMetricsData:
+            self.names.removeName(bodyMetricsKey)
+            del self.bodyMetricsData[bodyMetricsKey]
+            return True
+        return False
+
+
+"""
+======== Менеджер кэша ===========
+
+class TrackCacheManager:
+    def __init__(self):
+        self.settings = QgsSettings()
+        self.settings_prefix = "plugins/my_elevation_plugin/"
+        
+        # Папка для бинарных файлов в temp
+        self.cache_dir = os.path.join(QDir.tempPath(), "qgis_elevation_plugin_cache")
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+
+    def generate_new_track_id(self) -> str:
+        Генерирует уникальный UUID для нового трека
+        return uuid.uuid4().hex
+
+    def save_track_data(self, track_id: str, distances: np.ndarray, hSavgol: np.ndarray, gradients_pct: np.ndarray) -> bool:
+        Сохраняет данные по его уникальному UUID
+        try:
+            # 1. Формируем путь к файлу на основе UUID
+            filename = f"track_{track_id}.npz"
+            file_path = os.path.join(self.cache_dir, filename)
+            
+            # 2. Быстрая бинарная запись данных
+            np.savez_compressed(
+                file_path, 
+                distances=distances, 
+                hSavgol=hSavgol, 
+                gradients_pct=gradients_pct
+            )
+            
+            # 3. Записываем путь в настройки QGIS
+            settings_key = f"{self.settings_prefix}tracks/{track_id}"
+            self.settings.setValue(settings_key, file_path)
+            
+            # Запоминаем этот UUID как последний активный
+            self.settings.setValue(f"{self.settings_prefix}last_active_track_id", track_id)
+            
+            # Опционально: запускаем умную очистку, если треков стало слишком много
+            self._auto_limit_cache(max_tracks=20)
+            
+            return True
+        except Exception as e:
+            print(f"Ошибка сохранения кэша для UUID {track_id}: {e}")
+            return False
+
+    def load_track_data(self, track_id: str = None):
+        Загружает данные по UUID. Если UUID не указан — берет последний активный
+        try:
+            if track_id is None:
+                track_id = self.settings.value(f"{self.settings_prefix}last_active_track_id", "")
+                if not track_id:
+                    return None, None, None
+            
+            settings_key = f"{self.settings_prefix}tracks/{track_id}"
+            file_path = self.settings.value(settings_key, "")
+            
+            if not file_path or not os.path.exists(file_path):
+                print(f"Файл кэша для UUID {track_id} не найден на диске")
+                return None, None, None
+            
+            with np.load(file_path) as data:
+                return data['distances'], data['hSavgol'], data['gradients_pct']
+                
+        except Exception as e:
+            print(f"Ошибка загрузки кэша для UUID {track_id}: {e}")
+            return None, None, None
+
+    def delete_track_data(self, track_id: str) -> bool:
+        УДАЛЕНИЕ ОДНОГО ТРЕКА.
+        Удаляет файл с диска и стирает ключ из QgsSettings.
+        try:
+            settings_key = f"{self.settings_prefix}tracks/{track_id}"
+            file_path = self.settings.value(settings_key, "")
+            
+            # 1. Удаляем физический файл с диска, если он существует
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+            
+            # 2. Удаляем ключ из QgsSettings
+            self.settings.remove(settings_key)
+            
+            # 3. Если удаляемый трек был активным, зануляем указатель на него
+            last_active = self.settings.value(f"{self.settings_prefix}last_active_track_id", "")
+            if last_active == track_id:
+                self.settings.remove(f"{self.settings_prefix}last_active_track_id")
+                
+            print(f"Данные для трека {track_id} успешно удалены")
+            return True
+        except Exception as e:
+            print(f"Ошибка при удалении трека {track_id}: {e}")
+            return False
+
+    def _auto_limit_cache(self, max_tracks: int = 20):
+        Внутренний метод автоматической очистки старых файлов.
+        Удерживает в кэше не более max_tracks последних созданных треков.
+        try:
+            # Получаем список всех файлов кэша плагина
+            files = [os.path.join(self.cache_dir, f) for f in os.listdir(self.cache_dir) if f.endswith(".npz")]
+            if len(files) <= max_tracks:
+                return
+                
+            # Сортируем файлы по времени изменения (старые — первыми)
+            files.sort(key=os.path.getmtime)
+            
+            # Находим количество файлов на удаление
+            files_to_delete = files[:(len(files) - max_tracks)]
+            
+            for file_path in files_to_delete:
+                # Извлекаем UUID из имени файла (из "track_xxxx.npz" получаем "xxxx")
+                filename = os.path.basename(file_path)
+                track_id = filename.replace("track_", "").replace(".npz", "")
+                
+                # Вызываем полное удаление
+                self.delete_track_data(track_id)
+        except Exception as e:
+            print(f"Ошибка автоматической лимитации кэша: {e}")
+
+    def clear_all_cache(self):
+        Полная очистка всех данных плагина
+        if os.path.exists(self.cache_dir):
+            for f in os.listdir(self.cache_dir):
+                if f.endswith(".npz"):
+                    try: os.remove(os.path.join(self.cache_dir, f))
+                    except: pass
+        self.settings.remove(self.settings_prefix)
+        
+-------- Создание и сохранение нового трека:
+cache = TrackCacheManager()
+
+# Генерируем UUID один раз при импорте нового GPX
+current_track_id = cache.generate_new_track_id() 
+
+# Сохраняем рассчитанные массивы
+cache.save_track_data(current_track_id, targetDistances, hSavgol, gradients_pct)
+
+# Передаем этот current_track_id в другие слои плагина или в QGIS-объекты
+
+---------- Загрузка конкретного трека:
+# Например, пользователь кликнул по треку в вашем списке плагина
+distances, heights, gradients = cache.load_track_data(current_track_id)
+
+---------- Удаление данных пользователем:
+# Стирает файл и настройки, освобождая память
+cache.delete_track_data(current_track_id)
+        
+"""
+
+
+class Profiles:
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.profilesPath = 'Plugins/countRoutesProfiles'
+        self.profilesData = self.settings.value(
+            self.profilesPath,
+            {}
+        )
+        initialNames = {key: it['name'] for key, it in self.profilesData.items()}
+        self.names = NameManager(initialNames)
+        for key, name in self.names.getNames().items():
+            self.profilesData[key]['name'] = name
+        self.lastActiveProfilePath = 'Plugins/countRoutesLastActiveProfile'
+        self.lastActiveProfileKey = self.settings.value(
+            self.lastActiveProfilePath,
+            None
+        )
+        if self.lastActiveProfileKey not in self.profilesData:
+            self.lastActiveProfileKey = next((k for k, v in self.profilesData.items()), None)
+
+    def createData(self, data):
+        if self.isProfileAvailable(data):
+            profileKey = uuid.uuid4().hex
+            data['name'] = self.names.addName(data['name'], profileKey)
+            if not data['name']:
+                return None
+            self.profilesData[profileKey] = data
+            return profileKey
+        return None
+
+    def isProfileAvailable(self, data):
+        pass
+        return True
+
+    def getKeys(self):
+        return [k for k in self.profilesData]
+
+    def getData(self, key):
+        return self.profilesData[key] if key in self.profilesData else None
+
+    def getCurrentData(self):
+        if self.lastActiveProfileKey in self.profilesData:
+            return self.profilesData[self.lastActiveProfileKey]
+        return None
+
+    def getCurrentKey(self):
+        return self.lastActiveProfileKey
+
+    def setCurrentData(self, profileKey):
+        if profileKey != self.lastActiveProfileKey and profileKey in self.profilesData:
+            self.lastActiveProfileKey = profileKey
+
+    def editData(self, profileKey, data):
+        if profileKey not in self.profilesData:
+            return False
+        if self.isProfileAvailable(data):
+            pass
+            return True
+        return False
+
+    def removeData(self, profileKey):
+        if profileKey in self.profilesData:
+            self.names.removeName(profileKey)
+            del self.profilesData[profileKey]
+            if self.lastActiveProfileKey == profileKey:
+                self.lastActiveProfileKey = next((k for k, v in self.profilesData.items()), None)
+            return True
+        return False
+
+
 class SmartProfile:
     altitudeSamplingStep: int = 10  # The distance step (in meters) for getting elevation data from external sources
     altitudeDelayOpenTopoData: float = 1.2  # Latency for Open Topo Data (server requires > 1 sec between requests)
@@ -254,26 +708,50 @@ class SmartProfile:
     def __init__(self, mbModule):
         self.x = None
         self.y = None
-        self.spline = None
-        self.derivativeSpline = None
+
+        self.minX = self.minY = 0
+        self.maxX = self.maxY = 100
+        self.splines = {
+            'profile': {
+                'spline': None,
+                'rect': QRectF(self.minX, self.minY, self.maxX, self.maxY),
+                'gradient': None
+            },
+            'temperature': {
+                'original': None,
+                'external': None,
+                'edited': None
+            },
+            'humidity': {
+                'original': None,
+                'external': None,
+                'edited': None
+            },
+            'surface': {
+                'original': None,
+                'edited': None
+            }
+        }
+
+        self.spline = None  # NB!
+        self.currentSpline = None
+        self.currentRect = QRectF(0, 0, 100, 100)
+        self.currentGradientSpline = None
+
         self.energySpline = None
         self.glycogenLevelSpline = None
         self.fluidLossSpline = None
         self.speedSpline = None
-        self.etaSpline = None
+        # self.etaSpline = None
         self.etaSegments = []
         self.etaArray = None
-        self.temperatureSpline = None
-        self.humiditySpline = None
+        # self.temperatureSpline = None
+        # self.humiditySpline = None
         self.rechargesPlan = None
-        self.editSpline = None
-        self.editTemperatureSpline = None
-        self.editHumiditySpline = None
-        self.editEtaSpline = None
-        self.minX = 0
-        self.maxX = 100
-        self.minY = 0
-        self.maxY = 100
+        # self.editSpline = None
+        # self.editTemperatureSpline = None
+        # self.editHumiditySpline = None
+        # self.editEtaSpline = None
         self.minE = self.maxE = 0   # Elevations range
         self.minG = self.maxG = 0   # Gradient range
         self.minS = self.maxS = 0   # Speed range
@@ -285,13 +763,105 @@ class SmartProfile:
         self.altitudePoints = []
         self.moveCursor = None
 
-    def makeData(self, geometryZ, bodyMetric):
+        self.coords = {
+            'len': 0,
+            'totalDist': 0.0,
+            'dists': None,
+            'lons': None,
+            'lats': None,
+            'eles': None,
+            'grads': None
+        }
+
+        self.currentProfile = {
+            'realStep': None,
+            'distances': np.array([]),
+            'lons': np.array([]),
+            'lats': np.array([]),
+            'eles': np.array([]),
+            'grads': np.array([]),
+            'nanRatio': None,
+            'maxDetectedGap': None
+        }
+        self.gradInDegrees = True
+
+    def setGradInDegrees(self, isGradInDegrees):
+        self.gradInDegrees = isGradInDegrees
+
+    def isGradInDegrees(self):
+        return self.gradInDegrees
+
+    def getResamplingData(self, lons, lats, eles):
         """
-        The method gets data (x, y, z) from geometryZ and
-        creates data sets (splines) for charts
-        :param geometryZ: input spatial data
-        :return: a set of splines
+        Calling resampling method from the algorithm module.
+        :param lons: The list of longitudes (float)
+        :param lats: The list of latitudes (float)
+        :param eles: The list of elevations (float)
+        :return: resamplingData = {
+            'realStep': realStep,
+            'distances': numpy array,
+            'lons': numpy array,
+            'lats': numpy array,
+            'eles': numpy array,
+            'nanRatio': float,
+            'maxDetectedGap': float
+        }
         """
+        return self.mbModule.resampling(lons, lats, eles)
+
+    def createNewProfile(self, name, data, isSteepSlope=False):
+        """
+        data = {
+            'realStep': realStep,
+            'distances': targetDistances, # a numpy array
+            'lons': newLons, # a numpy array
+            'lats': newLats, # a numpy array
+            'eles': newEles, # a numpy array
+            'nanRatio': nanRatio,
+            'maxDetectedGap': maxDetectedGap
+        }
+        """
+        if not self.isDistances(data):
+            return False
+        self.currentProfile['distances'] = data['distances']
+        if self.isProfile(data):
+            (
+                self.currentProfile['eles'],
+                self.currentProfile['grads']
+            ) = self.mbModule.profileSmoothing(
+                data['distances'],
+                data['eles'],
+                isSteepSlope
+            )
+        return True
+
+    def isDistances(self, data=None):
+        if data:
+            return (isinstance(data, dict) and 'distances' in data
+                    and isinstance(data['distances'], np.ndarray) and len(data['distances']) > 0)
+        return len(self.currentProfile['distances']) > 0
+
+    def isProfile(self, data=None):
+        if data is not None:
+            return (isinstance(data, dict) and 'eles' in data and
+                    isinstance(data['eles'], np.ndarray) and len(data['eles']) > 1)
+        return len(self.currentProfile['eles']) > 1
+
+    def getTotalLength(self):
+        return self.currentProfile['distances'][-1] if self.isDistances() else 0.0
+
+    def getDistanceEnds(self):
+        if self.isDistances():
+            return self.currentProfile['distances'].min(), self.currentProfile['distances'].max()
+        return None
+
+    def getElevationEnds(self):
+        if self.isProfile():
+            return self.currentProfile['eles'].min(), self.currentProfile['eles'].max()
+        return None
+
+    """
+    def makeData(self, geometryZ, bodyMetrics):
         # Creating a copy of geometry to remove duplicate nodes
         lineString = geometryZ.get()
         lineString.removeDuplicateNodes()
@@ -325,20 +895,21 @@ class SmartProfile:
             yRaw = np.array([lineString.zAt(i) for i in range(lineString.numPoints())])
         else:
             yRaw = None
-
         (
             self.x,
-            self.minX,
-            self.maxX,
-            self.spline,
-            self.minE,
-            self.maxE,
-            self.derivativeSpline,
+            minX,
+            maxX,
+            self.splines['profile']['original']['spline'],
+            minY,
+            maxY,
+            self.splines['profile']['original']['gradient'],
             self.minG,
             self.maxG,
             rmse,
             gainError
         ) = self.mbModule.prepareElevationData(xRaw, yRaw, mode='route')
+        viewRect = QRectF(minX, minY, maxX - minX, maxY - minY)
+        self.splines['profile']['original']['rect'] = viewRect
         self.etaSegments = [[0.0, 1.0, float(self.mbModule.DEFAULT_ETA)]]
         self.etaArray = self.buildEtaArray()
         self.etaSpline = self.createEtaSpline()
@@ -363,7 +934,7 @@ class SmartProfile:
             d = (totalLength / (numPoints - 1)) * i
             print(f'Points: d = {d}, type = {type(d)}')
             point = geom2D.interpolate(d)
-            h = float(self.spline(d))
+            h = float(self.splines['profile']['original']['spline'](d))
             # crsSrc = QgsProject.instance().crs()
             # crsWGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
             # transform = QgsCoordinateTransform(crsSrc, crsWGS84, QgsProject.instance())
@@ -390,10 +961,10 @@ class SmartProfile:
         self.temperatureSpline = self.createCubicSpline(tData)
         self.humiditySpline = self.createCubicSpline(hData)
 
-        self.minY = self.minE
-        self.maxY = self.maxE
-        print(f'minX = {self.minX}, max = {self.maxX}')
-        print(f'minY = {self.minY}, maxY = {self.maxY}')
+        # self.minY = self.minE
+        # self.maxY = self.maxE
+        # print(f'minX = {self.minX}, max = {self.maxX}')
+        # print(f'minY = {self.minY}, maxY = {self.maxY}')
         miG = np.degrees(np.arctan(float(self.minG)))
         maG = np.degrees(np.arctan(float(self.maxG)))
         print(f'minG = {"{: 2.2f} °".format(miG)}, maxG = {"{: 2.2f} °".format(maG)}')
@@ -402,7 +973,97 @@ class SmartProfile:
         #     Набору высоты верить нельзя, его нужно делить на 1.5–2.
         # b) Если RMSE < 0.5 метров: Данные из QGIS (DEM) или качественного барометра.
         #     Набор высоты будет максимально точным.
+        self.burnBudget(bodyMetrics)
+        print(f'Total calories = {self.totalCalories} kcal')
+        self.setCurrentProfile('original')
+        return True
 
+    def createProfileData(self, xRaw, weatherPoints, altitudePoints, bodyMetrics, yRaw=None, mode='route'):
+
+        xData, yData = self.mbModule.prepareElevationData(xRaw, yRaw, mode=mode)
+        etaSegments = [[0.0, 1.0, float(self.mbModule.DEFAULT_ETA)]]
+        etaArray = np.full_like(xData, self.mbModule.DEFAULT_ETA, dtype=float)
+        for start, end, eta in etaSegments:
+            mask = (xData >= start * xData[-1]) & (xData <= end * xData[-1])
+            etaArray[mask] = eta
+        elevSpline, gradientSpline, etaSpline = self.mbModule.constructProfileSplines(xData, yData, etaArray)
+
+        minX = xData[0]
+        maxX = xData[-1]
+        ySmooth = elevSpline(xData)
+        idxMin = np.argmin(ySmooth)
+        idxMax = np.argmax(ySmooth)
+        distAtMin = xData[idxMin]
+        distAtMax = xData[idxMax]
+        minY = elevSpline(distAtMin)
+        maxY = elevSpline(distAtMax)
+
+        ySmooth = gradientSpline(xData)
+        idxMin = np.argmin(ySmooth)
+        idxMax = np.argmax(ySmooth)
+        distAtMin = xData[idxMin]
+        distAtMax = xData[idxMax]
+        minG = gradientSpline(distAtMin)
+        maxG = gradientSpline(distAtMax)
+
+        viewRect = QRectF(minX, minY, maxX - minX, maxY - minY)
+
+        # Adaptive number of points (from 3 to 7 per 100 km)
+        totalLengthKm = totalLength / 1000
+        numPoints = 3 if totalLengthKm < 30 else (5 if totalLengthKm < 70 else 7)
+        crsSrc = QgsProject.instance().crs()
+        crsWGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        transform = QgsCoordinateTransform(crsSrc, crsWGS84, QgsProject.instance())
+        for i in range(numPoints):
+            d = (totalLength / (numPoints - 1)) * i
+            print(f'Points: d = {d}, type = {type(d)}')
+            point = geom2D.interpolate(d)
+            h = float(self.splines['profile']['original']['spline'](d))
+            # crsSrc = QgsProject.instance().crs()
+            # crsWGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+            # transform = QgsCoordinateTransform(crsSrc, crsWGS84, QgsProject.instance())
+            pt = point.asPoint()
+            ptWGS84 = transform.transform(pt)
+            self.weatherPoints.append(
+                (ptWGS84.y(), ptWGS84.x(), d, h, self.mbModule.DEFAULT_TEMPERATURE, self.mbModule.DEFAULT_HUMIDITY)
+            )
+        print(f'Result points for temperature and humidity building = {self.weatherPoints}')
+
+        altitudeX = np.arange(0.0, totalLength, self.altitudeSamplingStep)
+        self.altitudePoints = []
+        for x in altitudeX:
+            point = geom2D.interpolate(float(x))
+            pt = point.asPoint()
+            ptWGS84 = transform.transform(pt)
+            self.altitudePoints.append({"lat": ptWGS84.y(), "lon": ptWGS84.x(), "dist": float(x), "elev": None})
+
+        tData = []
+        hData = []
+        for it in self.weatherPoints:
+            tData.append({'distance': it[2], 'value': self.mbModule.DEFAULT_TEMPERATURE})
+            hData.append({'distance': it[2], 'value': self.mbModule.DEFAULT_HUMIDITY})
+        self.temperatureSpline = self.createCubicSpline(tData)
+        self.humiditySpline = self.createCubicSpline(hData)
+
+        # self.minY = self.minE
+        # self.maxY = self.maxE
+        # print(f'minX = {self.minX}, max = {self.maxX}')
+        # print(f'minY = {self.minY}, maxY = {self.maxY}')
+        miG = np.degrees(np.arctan(float(self.minG)))
+        maG = np.degrees(np.arctan(float(self.maxG)))
+        print(f'minG = {"{: 2.2f} °".format(miG)}, maxG = {"{: 2.2f} °".format(maG)}')
+        print(f'----- RMSE = {rmse}, Gain Error = {gainError}')
+        # a) Если RMSE > 2-3 метров: Ваш GPX-трек очень шумный (плохой сигнал в лесу или ущелье).
+        #     Набору высоты верить нельзя, его нужно делить на 1.5–2.
+        # b) Если RMSE < 0.5 метров: Данные из QGIS (DEM) или качественного барометра.
+        #     Набор высоты будет максимально точным.
+        self.burnBudget(bodyMetrics)
+        print(f'Total calories = {self.totalCalories} kcal')
+        self.setCurrentProfile('original')
+        return True
+        """
+
+    def burnBudget(self, bodyMetrics, isOptimizedSpeed=False):
         (
             self.totalCalories,
             self.energySpline,
@@ -418,21 +1079,61 @@ class SmartProfile:
             self.rechargesPlan
         ) = self.mbModule.prepareEnergyData(
                 self.x,
-                self.spline,
-                self.derivativeSpline,
-                bodyMetric['weight'],
-                bodyMetric['height'],
-                bodyMetric['age'],
-                bodyMetric['gender'] == 'm',
-                bodyMetric['speed'],
+                self.splines['profile']['original']['spline'],
+                self.splines['profile']['original']['gradient'],
+                bodyMetrics['weight'],
+                bodyMetrics['height'],
+                bodyMetrics['age'],
+                bodyMetrics['gender'] == 'm',
+                bodyMetrics['speed'],
                 self.etaSpline,
                 self.temperatureSpline,
                 self.humiditySpline,
-                massPack=bodyMetric['cargo'],
-                isOptimizedSpeed=False
+                massPack=bodyMetrics['cargo'],
+                isOptimizedSpeed=isOptimizedSpeed
             )
-        print(f'Total calories = {self.totalCalories} kcal')
-        return True
+
+    def setCurrentProfile(self, splineKey, rasterId=None):
+        if rasterId is None:
+            self.currentSpline = self.splines['profile'][splineKey]['spline']
+            self.currentRect = self.splines['profile'][splineKey]['rect']
+            self.currentGradientSpline = self.splines['profile'][splineKey]['gradient']
+        else:
+            self.currentSpline = self.splines['profile']['rasters'][rasterId]['spline']
+            self.currentRect = self.splines['profile']['rasters'][rasterId]['rect']
+            self.currentGradientSpline = self.splines['profile']['rasters'][rasterId]['gradient']
+
+    def setCurrentTemperature(self, splineKey):
+        self.currentTemperature = self.splines['temperature'][splineKey]
+
+    def setCurrentHumidity(self, splineKey):
+        self.currentHumidity = self.splines['humidity'][splineKey]
+
+    def setCurrentSurface(self, splineKey):
+        self.currentSurface = self.splines['surface'][splineKey]
+
+    def getOriginalData(self):
+        return (
+            self.splines['profile']['original']['spline'],
+            self.splines['profile']['original']['rect'],
+            self.splines['profile']['original']['gradient'],
+            self.splines['temperature']['original'],
+            self.splines['humidity']['original'],
+            self.splines['surface']['original']
+        )
+
+    def getCurrentData(self, dataKey):
+        # This is used in the profile dialog when splines may be changed
+        return {
+            dataKey == 'profile': (
+                self.currentSpline,
+                self.currentRect,
+                self.currentGradientSpline
+            ),
+            dataKey == 'temperature': self.currentTemperature,
+            dataKey == 'humidity': self.currentHumidity,
+            dataKey == 'surface': self.currentSurface
+        }[True]
 
     def buildEtaArray(self):
         etaArray = np.full_like(self.x, self.mbModule.DEFAULT_ETA, dtype=float)
@@ -441,9 +1142,9 @@ class SmartProfile:
             etaArray[mask] = eta
         return etaArray
 
-    def createEtaSpline(self, data=None):
+    def createEtaSpline(self, xData, data=None):
         if data:
-            start, end = float(data['start']) / self.x[-1], float(data['end'] / self.x[-1])
+            start, end = float(data['start']) / xData[-1], float(data['end'] / xData[-1])
             newSegments = []
             for s, e, eta in self.etaSegments:
                 if e <= start or s >= end:
@@ -458,7 +1159,7 @@ class SmartProfile:
             self.etaArray = self.buildEtaArray()
 
         spline = interp1d(
-            self.x,
+            xData,
             self.etaArray,
             kind='nearest',
             bounds_error=False,
@@ -479,6 +1180,7 @@ class SmartProfile:
         spline = CubicSpline(xPoints, yPoints, bc_type='natural')
         return spline
 
+    """
     def copySplines(self, flags, isUpdated=False):
         if isUpdated:
             if 'all' in flags:
@@ -504,6 +1206,7 @@ class SmartProfile:
                 self.editHumiditySpline = copy.deepcopy(self.humiditySpline)
             elif 'eta' in flags:
                 self.editEtaSpline = copy.deepcopy(self.etaSpline)
+    """
 
     def changeEditSpline(self, flag, data):
         if flag == 'temperature':
@@ -513,18 +1216,27 @@ class SmartProfile:
         elif flag == 'eta':
             self.editEtaSpline = self.createEtaSpline(data)
 
+    def getInstantData(self, currentX):
+        if self.isDistances() and self.isProfile():
+            return (
+                np.interp(currentX, self.currentProfile['distances'], self.currentProfile['eles']),
+                np.interp(currentX, self.currentProfile['distances'], self.currentProfile['grads'])
+            )
+        return None
+
     def getOriginalData(self, currentX):
         # Instantly getting height and gradient (O(log N))
         # Splines in scipy are optimized for fast search of the required segment
-        elev = float(self.spline(currentX))
+        elev = float(self.splines['profile']['original']['spline'](currentX))
         # grad = math.radians(float(self.derivativeSpline(currentX)))
-        grad = np.degrees(np.arctan(float(self.derivativeSpline(currentX))))
+        grad = np.degrees(np.arctan(float(self.splines['profile']['original']['gradient'](currentX))))
         energy = float(self.energySpline(currentX))
         temp = float(self.temperatureSpline(currentX))
         rh = float(self.humiditySpline(currentX)) * 100
         eta = float(self.etaSpline(currentX))
         return elev, grad, energy, temp, rh, eta
 
+    # !!!!!
     def getConstructedData(self, currentX):
         # Instantly getting height and gradient (O(log N))
         # Splines in scipy are optimized for fast search of the required segment
@@ -537,13 +1249,15 @@ class SmartProfile:
         eta = float(self.editEtaSpline(currentX))
         return elev, grad, energy, temp, rh, eta
 
+    @staticmethod
     def getPainterElevationProfile(
-            self,
-            viewRect,  # The rectangle with coordinates (minX, minY) (maxX, maxY)
-            indent,  # Indents between canvas edges and the graph array
-            dataViewSize,  # The size of the graph array
-            plotPointsShare,  # The share of chart reference points
-            isAxisRatioLocked=True
+        viewRect,  # The rectangle with coordinates (minX, minY) (maxX, maxY)
+        indent,  # Indents between canvas edges and the graph array
+        dataViewSize,  # The size of the graph array
+        abscissas,  # The array of x-coordinates of spline points
+        spline,     # The elevation spline
+        plotPointsShare,  # The share of chart reference points
+        isAxisRatioLocked=True
     ):
         # Generates a path for QPainter.
         path = QPainterPath()
@@ -566,8 +1280,8 @@ class SmartProfile:
 
         x1 = viewRect.left()
         x2 = viewRect.right()
-        plotX = np.unique(np.concatenate(([x1], self.x[(self.x >= x1) & (self.x <= x2)], [x2])))
-        plotY = self.spline(plotX)
+        plotX = np.unique(np.concatenate(([x1], abscissas[(abscissas >= x1) & (abscissas <= x2)], [x2])))
+        plotY = spline(plotX)
 
         # Scaling data to fit pixels
         # points = [QPointF(px * xScale, py * yScale) for px, py in zip(plotX, plotY)]
@@ -602,6 +1316,77 @@ class SmartProfile:
                 points = [toPxAxisLockYBased(pX, pY) for pX, pY in zip(plotX, plotY)]
         else:
             points = [toPx(pX, pY) for pX, pY in zip(plotX, plotY)]
+        if not any(it.x() - indent.left < 0 or it.x() - indent.left > xWidth or
+                   it.y() - indent.top < 0 or it.y() - indent.top > dataViewSize.height() for it in points):
+            path.addPolygon(QPolygonF(points))
+        return path
+
+    def getPainterElevationPath(self,
+        viewRect,  # The rectangle with coordinates (minX, minY) (maxX, maxY)
+        indent,  # Indents between canvas edges and the graph array
+        dataViewSize,  # The size of the graph array
+        isAxisRatioLocked=True
+    ):
+        # Generates a path for QPainter.
+        path = QPainterPath()
+        isXBased = True
+        xWidth = dataViewSize.width()
+        # if isAxisRatioLocked and viewRect.height() > viewRect.width():
+        #     xWidth = dataViewSize.height() / viewRect.height() * viewRect.width()
+        #     nP = dataViewSize.height() * plotPointsShare
+        #     isXBased = False
+        # else:
+        #     nP = dataViewSize.width() * plotPointsShare
+        # if nP < len(self.x):
+        #     # Key points are more than step points
+        #     plotX = self.x
+        #     plotY = self.y
+        # else:
+        #     # Creating step points
+        #     plotX = np.arange(self.x[0], self.x[-1], (self.x[-1] - self.x[0]) / nP)
+        #     plotY = self.spline(plotX)
+
+        # x1 = viewRect.left()
+        # x2 = viewRect.right()
+        # plotX = np.unique(np.concatenate(([x1], abscissas[(abscissas >= x1) & (abscissas <= x2)], [x2])))
+        # plotY = spline(plotX)
+
+        # Scaling data to fit pixels
+        # points = [QPointF(px * xScale, py * yScale) for px, py in zip(plotX, plotY)]
+        # path.addPolygon(QPolygonF(points))
+        # print(f'boundingRect() = {path.boundingRect()}')
+
+        def toPx(pX, pY):
+            px = ((pX - viewRect.left()) / viewRect.width()) * xWidth
+            py = dataViewSize.height() - ((pY - viewRect.top()) / viewRect.height()) * dataViewSize.height()
+            return QPointF(px + indent.left, py + indent.top)
+
+        def toPxAxisLockXBased(pX, pY):
+            px = ((pX - viewRect.left()) / viewRect.width()) * xWidth
+            py = dataViewSize.height() / 2 - (pY - viewRect.top()) * \
+                 (xWidth / viewRect.width())
+            """
+            y = int(dataViewSize.height() / 2 - (realY - viewRect.top()) / self.gsd) + \
+                    self.typo.indent.top
+            """
+            return QPointF(px + indent.left, py + indent.top)
+
+        def toPxAxisLockYBased(pX, pY):
+            px = ((pX - viewRect.left()) / viewRect.width()) * xWidth
+            py = dataViewSize.height() / 2 - (pY - viewRect.top()) * \
+                 (xWidth / viewRect.width())
+            return QPointF(px + indent.left, py + indent.top)
+
+        zipData = zip(self.currentProfile['distances'], self.currentProfile['eles'])
+        if not zipData:
+            return None
+        if isAxisRatioLocked:
+            if isXBased:
+                points = [toPxAxisLockXBased(pX, pY) for pX, pY in zipData]
+            else:
+                points = [toPxAxisLockYBased(pX, pY) for pX, pY in zipData]
+        else:
+            points = [toPx(pX, pY) for pX, pY in zipData]
         if not any(it.x() - indent.left < 0 or it.x() - indent.left > xWidth or
                    it.y() - indent.top < 0 or it.y() - indent.top > dataViewSize.height() for it in points):
             path.addPolygon(QPolygonF(points))
@@ -766,7 +1551,7 @@ class PlotInteraction(QObject):
         indent = self.typo.indent
         if (not dataViewSize.width() or
                 not dataViewSize.height() or
-                self.gsd is None or self.smartProfile.spline is None):
+                self.gsd is None or not self.smartProfile.isDistances()):
             self.hideCursor()
             return
         # Calculating real coordinates relative to a logical data rectangle
@@ -778,7 +1563,18 @@ class PlotInteraction(QObject):
         y = scenePos.y()
         hideOnlyY = False
 
-        realY, grad, energy, temp, rh, eta = self.smartProfile.getOriginalData(realX)
+        realY, gradInPercents = self.smartProfile.getInstantData(realX)
+        if realY is None:
+            self.hideCursor(True)
+            self.infoDisplayData['distance'] = self.typo.distanceTextFormatInfo.format(realX)
+            self.infoDisplayData['elevation'] = ''
+            self.infoDisplayData['gradient'] = ''
+            self.infoDisplayData['energy'] = ''
+            self.infoDisplayData['temperature'] = ''
+            self.infoDisplayData['humidity'] = ''
+            self.infoDisplayData['eta'] = ''
+            self.showInfoDisplayData.emit(self.infoDisplayData)
+            return
 
         if self.snapping:
             if self.isAxisRatioLocked:
@@ -823,22 +1619,37 @@ class PlotInteraction(QObject):
         else:
             self.labelY.setPos(sRect.left() + offset - 1, y - yTextHeight - 2 * offset)
 
-        surfaceType = next((v['name'] for k, v in self.typo.etaData.items() if k == eta), '')
+        # !---------!
+        # surfaceType = next((v['name'] for k, v in self.typo.etaData.items() if k == eta), '')
+        # distInfo, elevInfo, gradInfo, energyInfo, tempInfo, rhInfo, etaInfo = (
+        #     self.typo.distanceTextFormatInfo.format(realX),
+        #     self.typo.elevationTextFormatInfo.format(realY),
+        #     self.typo.gradientTextFormatInfo.format(grad),
+        #     self.typo.energyTextFormatInfo.format(energy),
+        #     self.typo.temperatureTextFormatInfo.format(temp),
+        #     self.typo.humidityTextFormatInfo.format(rh),
+        #     surfaceType
+        # )
+        # self.smartProfile.setGradInDegrees(False)
         distInfo, elevInfo, gradInfo, energyInfo, tempInfo, rhInfo, etaInfo = (
             self.typo.distanceTextFormatInfo.format(realX),
             self.typo.elevationTextFormatInfo.format(realY),
-            self.typo.gradientTextFormatInfo.format(grad),
-            self.typo.energyTextFormatInfo.format(energy),
-            self.typo.temperatureTextFormatInfo.format(temp),
-            self.typo.humidityTextFormatInfo.format(rh),
-            surfaceType
+
+            self.typo.gradientPTextFormatInfo.format(gradInPercents)
+            if not self.smartProfile.isGradInDegrees() else
+            self.typo.gradientDTextFormatInfo.format(np.degrees(np.arctan(gradInPercents / 100))),
+
+            '',
+            '',
+            '',
+            ''
         )
         # print(f'gradInfo = {gradInfo}, energyInfo = {energyInfo}')
         if hideOnlyY:
             self.hideCursor(hideOnlyY)
             self.infoDisplayData['distance'] = distInfo
             self.infoDisplayData['elevation'] = ''
-            self.infoDisplayData['gradient'] = gradInfo
+            self.infoDisplayData['gradient'] = ''
             self.infoDisplayData['energy'] = energyInfo
             self.infoDisplayData['temperature'] = tempInfo
             self.infoDisplayData['humidity'] = rhInfo
@@ -1034,7 +1845,7 @@ class CanvasFilter(QObject):
                             self.dock.viewRect,
                             self.dock.dataViewSize,
                         )
-            else:
+            else:   # Mouse moving on the main dock
                 sPos = self.dock.canvas.mapToScene(event.pos())
                 # viewportSize = self.dock.canvas.viewport().size()
                 self.dock.plotUI.moveCursor(
@@ -1577,39 +2388,60 @@ class MyPlotDock(QgsDockWidget):
         self.plotUI.moveCursor = self.plotUI.moveDockCursor
         self.settings = QgsSettings()
 
-        self.travelerLimits = {
-            'age': mbModule.AGE_LIMIT,
-            'weight': mbModule.WEIGHT_LIMIT,
-            'height': mbModule.HEIGHT_LIMIT,
-            'speed': (
-                (int((mbModule.SPEED_LIMIT[0] * 3.6) * 100)) / 100,
-                int((mbModule.SPEED_LIMIT[1] * 3.6) * 100) / 100
-            ),
-            'cargo': mbModule.PACK_LIMIT
-        }
+        # self.travelerLimits = {
+        #     'age': mbModule.AGE_LIMIT,
+        #     'weight': mbModule.WEIGHT_LIMIT,
+        #     'height': mbModule.HEIGHT_LIMIT,
+        #     'speed': (
+        #         (int((mbModule.SPEED_LIMIT[0] * 3.6) * 100)) / 100,
+        #         int((mbModule.SPEED_LIMIT[1] * 3.6) * 100) / 100
+        #     ),
+        #     'cargo': mbModule.PACK_LIMIT
+        # }
+        # self.travelerDefaultId = 0
+        # self.travelerBioMetricsPath = 'Plugins/countRoutesTravelerBioMetrics'
+        # defaultTraveler = {
+        #     self.travelerDefaultId: {
+        #         "name": 'NoName (default)',
+        #         "gender": False,    # Male - False
+        #         "age": int(40),
+        #         "weight": float(80),
+        #         "height": int(180),
+        #         "speed": float(5),
+        #         "cargo": float(0)
+        #     }
+        # }
+        # self.travelerBioMetricsDic = self.settings.value(
+        #     self.travelerBioMetricsPath,
+        #     defaultTraveler
+        # )
+        # self.lastActiveTravelerPath = 'Plugins/countRoutesLastActiveTraveler'
+        # self.lastActiveTravelerKey = self.settings.value(
+        #     self.lastActiveTravelerPath,
+        #     self.travelerDefaultId
+        # )
+        self.travelers = BodyMetrics(mbModule, self.settings)
+        self.travelerDataFrame = None
+        self.travelerMenu = QMenu(self)
+        self.travelerSeparator = self.travelerMenu.addSeparator()
+        actionCreateTraveler = self.addSimpleAction(
+            self.travelerMenu,
+            'Create Traveler . . .',
+            'actionCreateTraveler',
+            self.createTraveler,
+            isNoDotLabel=False,
+            isNoButtons=False
+        )
+        self.travelerMenu.addAction(actionCreateTraveler)
+        self.travelerActionGroup = {}
+        for key in self.travelers.getKeys():
+            if self.travelers.getData(key) is not None:
+                action = self.addBioMetrics(self.travelers.getData(key)['name'], key)
+                self.travelerActionGroup[key] = action
+                # Inserting BEFORE the separator
+                self.travelerMenu.insertAction(self.travelerSeparator, action)
+        self.selectTraveler(self.travelerActionGroup[self.travelers.getCurrentKey()])
 
-        self.travelerDefaultId = 0
-        self.travelerBioMetricsPath = 'Plugins/countRoutesTravelerBioMetrics'
-        defaultTraveler = {
-            self.travelerDefaultId: {
-                "name": 'NoName (default)',
-                "gender": False,    # Male - False
-                "age": int(40),
-                "weight": float(80),
-                "height": int(180),
-                "speed": float(5),
-                "cargo": float(0)
-            }
-        }
-        self.travelerBioMetricsDic = self.settings.value(
-            self.travelerBioMetricsPath,
-            defaultTraveler
-        )
-        self.lastActiveTravelerPath = 'Plugins/countRoutesLastActiveTraveler'
-        self.lastActiveTravelerKey = self.settings.value(
-            self.lastActiveTravelerPath,
-            self.travelerDefaultId
-        )
         widgetContainer = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1625,6 +2457,8 @@ class MyPlotDock(QgsDockWidget):
         openMenu = QMenu(self)
         # actionLoadGPX = QAction("Load GPX", openMenu)
         # actionLoadGPX.triggered.connect(self.loadGPX)
+        # For calculating distance between two points with lon and lat
+        self.geod = pyproj.Geod(ellps='WGS84')
         actionLoadGPX = self.addSimpleAction(
             openMenu,
             'Load GPX',
@@ -1656,31 +2490,6 @@ class MyPlotDock(QgsDockWidget):
         icon = QIcon(iconPath)
         self.btnBodyMetrics.setIcon(icon)
         self.btnBodyMetrics.setPopupMode(QToolButton.InstantPopup)
-        self.travelerMenu = QMenu(self)
-        self.travelerSeparator = self.travelerMenu.addSeparator()
-        # actionCreateTraveler = QAction("Create Traveler . . .", self.travelerMenu)
-        # actionCreateTraveler.triggered.connect(self.createTraveler)
-        # actionCreateTraveler.setObjectName('actionCreateTraveler')
-        actionCreateTraveler = self.addSimpleAction(
-            self.travelerMenu,
-            'Create Traveler . . .',
-            'actionCreateTraveler',
-            self.createTraveler,
-            isNoDotLabel=False,
-            isNoButtons=False
-        )
-        self.travelerMenu.addAction(actionCreateTraveler)
-        self.travelerActionGroup = {}
-        for it in self.travelerBioMetricsDic:
-            action = self.addBioMetric(self.travelerBioMetricsDic[it]['name'], f'{it}')
-            self.travelerActionGroup[f'{it}'] = action
-            # Inserting BEFORE the separator
-            self.travelerMenu.insertAction(self.travelerSeparator, action)
-        if f'{self.lastActiveTravelerKey}' in self.travelerActionGroup:
-            widget = self.travelerActionGroup[f'{self.lastActiveTravelerKey}'].defaultWidget()
-        else:
-            widget = self.travelerActionGroup[f'{self.travelerDefaultId}'].defaultWidget()
-        widget.setSelected(True)
         self.btnBodyMetrics.setMenu(self.travelerMenu)
         self.btnBodyMetrics.setEnabled(True)
         toolBar.addWidget(self.btnBodyMetrics)
@@ -1690,7 +2499,7 @@ class MyPlotDock(QgsDockWidget):
         self.chartGroup = QActionGroup(self)
         self.btnSelectSurfaceType = QToolButton()
         self.btnSelectSurfaceType.setAutoRaise(True)
-        self.btnSelectSurfaceType.setToolTip("Select Graph")
+        self.btnSelectSurfaceType.setToolTip("Select Profile")
         iconPath = os.path.join(pluginPath, '', 'countroutes/img', 'charts.svg')
         icon = QIcon(iconPath)
         self.btnSelectSurfaceType.setIcon(icon)
@@ -1707,7 +2516,7 @@ class MyPlotDock(QgsDockWidget):
         self.btnSelectSurfaceType.setEnabled(False)
         toolBar.addWidget(self.btnSelectSurfaceType)
 
-        self.actionMount = QAction("Profile Settings", self)
+        self.actionMount = QAction("Edit Current Profile", self)
         iconPath = os.path.join(pluginPath, '', 'countroutes/img', 'icon_profile_settings.svg')
         icon = QIcon(iconPath)
         self.actionMount.setIcon(icon)
@@ -1784,7 +2593,8 @@ class MyPlotDock(QgsDockWidget):
         self.canvas.viewport().installEventFilter(self.eventFilter)
 
         # Data area dimensions
-        self.viewRect = QRectF(0, 0, 100, 100)
+        self.initViewRect = QRectF(0, 0, 100, 100)
+        self.viewRect = self.initViewRect
         self.dataViewSize = QSize()
         # Dynamic graph metadata
         self.plotTitle = "Graf Name"
@@ -1809,16 +2619,16 @@ class MyPlotDock(QgsDockWidget):
         viewport = self.canvas.viewport()
         return viewport.devicePixelRatioF()
 
-    def addBioMetric(self, name, actName):
+    def addBioMetrics(self, name, key):
         action = QWidgetAction(self.travelerMenu)
-        if actName == f'{self.travelerDefaultId}':
+        if self.travelers.isDefaultId(key):
             widget = SelectableMenuWidget(name, isEdited=True)
         else:
             widget = SelectableMenuWidget(name, isEdited=True, isDeleted=True)
         action.setDefaultWidget(widget)
-        action.setObjectName(actName)
+        action.setData(key)
         widget.deleteRequested.connect(lambda: self.remove_item(action))
-        widget.editRequested.connect(lambda: print(f"Редактируем: {self.travelerBioMetricsDic[int(actName)]['name']}"))
+        widget.editRequested.connect(lambda: print(f"Редактируем: {self.travelers.getData(key)['name']}"))
         widget.selected.connect(lambda: self.selectTraveler(action))
         return action
 
@@ -1831,8 +2641,8 @@ class MyPlotDock(QgsDockWidget):
         return action
 
     def remove_item(self, action):
-        self.travelerMenu.removeAction(action)
-        action.deleteLater()
+        # self.travelerMenu.removeAction(action)
+        # action.deleteLater()
         print("Удалено")
 
     def mountProfile(self):
@@ -1852,43 +2662,49 @@ class MyPlotDock(QgsDockWidget):
         # Далее используйте scipy.interpolate или аналоги для финального сплайна
 
     def createTraveler(self):
-        dlg = EditTravelerDialog(
-            True,
-            self.travelerBioMetricsDic[self.travelerDefaultId],
-            self.travelerLimits
+        dlg = QDialog()
+        dlg.setWindowTitle("Create Traveler Body Metrics")
+        dlg.resize(300, 400)
+        layout = QVBoxLayout(dlg)
+        self.travelerDataFrame = TravelerEdit(
+            self.travelers.getCurrentData(),
+            self.travelers.getLimits()
         )
+        layout.addWidget(self.travelerDataFrame)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
         canvas = iface.mapCanvas()
         topLeftScreenPoint = canvas.mapToGlobal(canvas.pos())
         dlg.move(topLeftScreenPoint)
         if dlg.exec() == QDialog.Accepted:
             try:
-                data = dlg.getTravelerData()
-                while True:
-                    travelerId = random.randint(100000, 999999)
-                    if travelerId not in self.travelerBioMetricsDic:
-                        break
-                self.travelerBioMetricsDic[travelerId] = data
-                action = self.addBioMetric(data['name'], f'{travelerId}')
-                self.travelerActionGroup[f'{travelerId}'] = action
-                self.selectTraveler(action)
-                # Inserting BEFORE the separator
-                self.travelerMenu.insertAction(self.travelerSeparator, action)
+                data = self.travelerDataFrame.getData()
+                travelerId = self.travelers.createData(data)
+                if travelerId is not None:
+                    action = self.addBioMetrics(data['name'], travelerId)
+                    self.travelerActionGroup[f'{travelerId}'] = action
+                    self.selectTraveler(action)
+                    # Inserting BEFORE the separator
+                    self.travelerMenu.insertAction(self.travelerSeparator, action)
             except:
                 ex = "{0}".format(traceback.format_exc())
                 msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
                 print(f' renderBackground {msg}')
+        dlg.deleteLater()
 
     def selectTraveler(self, action):
         try:
-            key = int(action.objectName())
+            key = action.data()
             print(f'Select action = {key}')
-            if self.lastActiveTravelerKey != key and key in self.travelerBioMetricsDic.keys():
-                widget = self.travelerActionGroup[f'{self.lastActiveTravelerKey}'].defaultWidget()
+            if self.travelers.getCurrentKey() != key:
+                widget = self.travelerActionGroup[self.travelers.getCurrentKey()].defaultWidget()
                 widget.setSelected(False)
                 widget = action.defaultWidget()
                 widget.setSelected(True)
-                self.lastActiveTravelerKey = key
-                print(f"New Selected Traveler = {self.travelerBioMetricsDic[self.lastActiveTravelerKey]}")
+                self.travelers.setCurrentData(key)
+                print(f"New Selected Traveler = {self.travelers.getCurrentData()['name']}")
         except:
             ex = "{0}".format(traceback.format_exc())
             msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
@@ -1960,14 +2776,21 @@ class MyPlotDock(QgsDockWidget):
         self.renderBackground()
 
     def zoomFull(self):
-        if self.smartProfile.x is None:
-            return
-        self.viewRect = QRectF(
-            self.smartProfile.minX,
-            self.smartProfile.minY,
-            self.smartProfile.maxX - self.smartProfile.minX,
-            self.smartProfile.maxY - self.smartProfile.minY
-        )
+        distEnds = self.smartProfile.getDistanceEnds()
+        elevEnds = self.smartProfile.getElevationEnds()
+        if distEnds is None:
+            self.viewRect = self.initViewRect
+            return False
+        elif elevEnds is None:
+            self.viewRect = QRectF(
+                distEnds[0], self.initViewRect.top(),
+                distEnds[1], self.initViewRect.bottom()
+            )
+        else:
+            self.viewRect = QRectF(
+                distEnds[0], elevEnds[0],
+                distEnds[1], elevEnds[1]
+            )
         # r = self.viewRect
         # print(f'viewRect.left = {self.plotUI.typo.labelFormatX.format(r.left())}')
         # print(f'viewRect.top = {self.plotUI.typo.labelFormatY.format(r.top())}')
@@ -1975,6 +2798,7 @@ class MyPlotDock(QgsDockWidget):
         # print(f'viewRect.right = {self.plotUI.typo.labelFormatY.format(r.right())}')
         self.renderBackground()
         self.actionZoomFull.setEnabled(False)
+        return True
 
     def panning(self, oldMosePos, newMousePos):
         if self.smartProfile.x is None:
@@ -2099,21 +2923,20 @@ class MyPlotDock(QgsDockWidget):
         # print(f'X-axis y = {vSize.height() - indent.bottom + 1}')
 
         # 3) The graph (painting WITH Antialiasing)
-        if self.smartProfile.x is not None:
+        if self.smartProfile.isProfile():
             p.setRenderHint(QPainter.Antialiasing, True)
             p.setPen(QPen(self.plotUI.typo.curveColor, 1.5))
             # print(f'viewRect = {self.viewRect}')
             # print(f'dataViewSize = {self.dataViewSize}')
             # print(f'plotPointsShare = {self.plotUI.typo.plotPointsShare}')
 
-            path = self.smartProfile.getPainterElevationProfile(
+            path = self.smartProfile.getPainterElevationPath(
                 self.viewRect,
                 indent,
                 self.dataViewSize,
-                self.plotUI.typo.plotPointsShare,
                 self.plotUI.isAxisRatioLocked
             )
-            if not path.isEmpty():
+            if path is not None and not path.isEmpty():
                 self.cachedPath = path
                 p.drawPath(self.cachedPath)
             elif self.cachedPath and not self.cachedPath.isEmpty():
@@ -2146,58 +2969,286 @@ class MyPlotDock(QgsDockWidget):
                 "Unable to read the selected file.\n Please select a valid file."
             )
             return
-        filePath = os.path.dirname(str(fileName[0]))
-        self.settings.setValue(self.lastProfileDirKey, filePath)
-        # self.settings.setValue(self.lastProfileDirKey, filePath, QgsSettings.Plugins)
         print(f'loadGPX: full path = {fileName[0]}, file name = {fileInfo.baseName()}')
-        vectorType = ''
-        geometry = None
-        for vType in ('routes', 'tracks'):
-            # v = QgsVectorLayer(
-            #     fileName[0] + "?type=" + vType,
-            #     fileInfo.baseName() + "_" + vType,
-            #     "gpx"
-            # )
-            vector = QgsVectorLayer(
-                fileName[0] + "|layername=" + vType,
-                fileInfo.baseName() + "_" + vType,
-                "ogr"
+        rawData = self.getGPXData(fileName[0])
+        result = self.makeDataChoice(rawData)
+        """
+        resultData = {
+            'realStep': realStep,
+            'distances': targetDistances,
+            'lons': newLons, # a numpy array
+            'lats': newLats, # a numpy array
+            'eles': newEles, # a numpy array
+            'nanRatio': nanRatio,
+            'maxDetectedGap': maxDetectedGap
+        }
+        """
+        if result is not None:
+            name = result[0]
+            resultData = result[1]
+            print(
+                f'loadGPX: realStep = {round(resultData["realStep"], 2)}, '
+                f'distance = {resultData["distances"][-1]}, '
+                f'lons = {len(resultData["lons"])}, lats = {len(resultData["lats"])}, '
+                f'eles = {len(resultData["eles"])}, nanRatio = {resultData["nanRatio"]}, '
+                f'maxDetectedGap = {resultData["maxDetectedGap"]}'
             )
-            # vector.setCrs(QgsProject.instance().crs3D())
-            params = {
-                'INPUT': vector,
-                'TARGET_CRS': QgsProject.instance().crs3D().authid(),
-                'OUTPUT': 'memory:'
-            }
-            result = processing.run("native:reprojectlayer", params)
-            resVector = result['OUTPUT']
-            if resVector.isValid() and resVector.featureCount() > 0:
-                vectorType = vType
-                geometry = [feat.geometry() for feat in resVector.getFeatures()][0]
-                break
-        if geometry is None:
+            res = self.smartProfile.createNewProfile(name, resultData)
+            self.zoomFull()
+            """
+            filePath = os.path.dirname(str(fileName[0]))
+            self.settings.setValue(self.lastProfileDirKey, filePath)
+            # self.settings.setValue(self.lastProfileDirKey, filePath, QgsSettings.Plugins)
+            vectorType = ''
+            geometry = None
+            for vType in ('routes', 'tracks'):
+                # v = QgsVectorLayer(
+                #     fileName[0] + "?type=" + vType,
+                #     fileInfo.baseName() + "_" + vType,
+                #     "gpx"
+                # )
+                vector = QgsVectorLayer(
+                    fileName[0] + "|layername=" + vType,
+                    fileInfo.baseName() + "_" + vType,
+                    "ogr"
+                )
+                # vector.setCrs(QgsProject.instance().crs3D())
+                params = {
+                    'INPUT': vector,
+                    'TARGET_CRS': QgsProject.instance().crs3D().authid(),
+                    'OUTPUT': 'memory:'
+                }
+                result = processing.run("native:reprojectlayer", params)
+                resVector = result['OUTPUT']
+                if resVector.isValid() and resVector.featureCount() > 0:
+                    vectorType = vType
+                    geometry = [feat.geometry() for feat in resVector.getFeatures()][0]
+                    break
+            if geometry is None:
+                QMessageBox.warning(
+                    None,
+                    "Opening GPX file",
+                    "Routes or tracks are not found."
+                )
+                return
+            elif not isinstance(geometry, QgsGeometry) or not geometry.isGeosValid():
+                QMessageBox.warning(
+                    None,
+                    "Opening GPX file",
+                    "The geometry of GPX file is not valid."
+                )
+                return
+            elif not self.smartProfile.makeData(geometry, self.travelerBioMetricsDic[self.travelerDefaultId]):
+                QMessageBox.warning(
+                    None,
+                    "Opening GPX file",
+                    "Path length is zero."
+                )
+                return
+            self.zoomFull()
+            # self.enableActions()
+            """
+
+    @staticmethod
+    def getGPXData(gpxPath):
+        driver = ogr.GetDriverByName("GPX")
+        datasource = driver.Open(gpxPath, 0)
+        rawData = {
+            'waypoints': [],  # [{"name": str, "lat": float, "lon": float, "ele": float/None}]
+            'tracks': {},     # {(track_id, seg_id): [{"lat": float, "lon": float, "ele": float/None}, ...]}
+            'routes': {}      # {route_id: [{"lat": float, "lon": float, "ele": float/None}, ...]}
+        }
+        if not datasource:
             QMessageBox.warning(
                 None,
                 "Opening GPX file",
-                "Routes or tracks are not found."
+                "Unable to read the selected file.\n Please select a valid file."
             )
-            return
-        elif not isinstance(geometry, QgsGeometry) or not geometry.isGeosValid():
-            QMessageBox.warning(
-                None,
-                "Opening GPX file",
-                "The geometry of GPX file is not valid."
-            )
-            return
-        elif not self.smartProfile.makeData(geometry, self.travelerBioMetricsDic[self.travelerDefaultId]):
-            QMessageBox.warning(
-                None,
-                "Opening GPX file",
-                "Path length is zero."
-            )
-            return
-        self.zoomFull()
-        self.enableActions()
+            return None
+        # 1: WAYPOINTS
+        waypointsLayer = datasource.GetLayerByName('waypoints')
+        if waypointsLayer and waypointsLayer.GetFeatureCount() > 0:
+            waypointsLayer.ResetReading()
+            wpTotal = 0
+            for feature in waypointsLayer:
+                wpTotal += 1
+                geom = feature.GetGeometryRef()
+                if not geom: continue
+                lon, lat = geom.GetX(), geom.GetY()
+                name = feature.GetField('name') or f"WP_{wpTotal}"
+                ele = feature.GetField('ele')  # OGR возвращает float или None, если поля нет
+                rawData['waypoints'].append({
+                    'name': name,
+                    'lat': lat,
+                    'lon': lon,
+                    'ele': ele
+                })
+        # 2: TRACKS
+        trackPointsLayer = datasource.GetLayerByName('track_points')
+        if trackPointsLayer and trackPointsLayer.GetFeatureCount() > 0:
+            trackPointsLayer.ResetReading()
+            for feature in trackPointsLayer:
+                trackFid = feature.GetField('track_fid')
+                trackSegId = feature.GetField('track_seg_id')
+                segmentKey = (trackFid, trackSegId)
+                geom = feature.GetGeometryRef()
+                if not geom: continue
+                lon, lat = geom.GetX(), geom.GetY()
+                ele = feature.GetField('ele')
+                if segmentKey not in rawData['tracks']:
+                    rawData['tracks'][segmentKey] = []
+                    rawData['tracks'][segmentKey].append({'lat': lat, 'lon': lon, 'ele': ele})
+                    continue
+                rawData['tracks'][segmentKey].append({'lat': lat, 'lon': lon, 'ele': ele})
+        # 3: ROUTES
+        routePointsLayer = datasource.GetLayerByName('route_points')
+        if routePointsLayer and routePointsLayer.GetFeatureCount() > 0:
+            routePointsLayer.ResetReading()
+            for feature in routePointsLayer:
+                routeFid = feature.GetField('route_fid')
+                geom = feature.GetGeometryRef()
+                if not geom: continue
+                lon, lat = geom.GetX(), geom.GetY()
+                ele = feature.GetField('ele')
+                if routeFid not in rawData['routes']:
+                    rawData['routes'][routeFid] = []
+                    rawData['routes'][routeFid].append({'lat': lat, 'lon': lon, 'ele': ele})
+                    continue
+                rawData['routes'][routeFid].append({'lat': lat, 'lon': lon, 'ele': ele})
+        datasource = None
+        return rawData
+
+    def makeDataChoice(self, data):
+        """
+            The structure of data:
+                data = {
+                    "waypoints": [{"name": str, "lat": float, "lon": float, "ele": float/None}]
+                    "tracks": {(track_id, seg_id): [{"lat": float, "lon": float, "ele": float/None}, ...]}
+                    "routes": {route_id: [{"lat": float, "lon": float, "ele": float/None}, ...]}
+                }
+        """
+        try:
+            grouped = defaultdict(list)
+            for (mainId, subId), items in data['tracks'].items():
+                grouped[mainId].append((subId, items))
+            tracks = {}     # {track_id: [{"lat": float, "lon": float, "ele": float/None}, ...]}
+            for mainId, subList in grouped.items():
+                subList.sort(key=lambda x: x[0])
+                resItems = []
+                for subId, items in subList:
+                    resItems.extend(items)
+                tracks[mainId] = resItems
+            if (
+                len(data['waypoints']) < 2 and
+                (len(tracks) == 0 or all([len(it) < 2 for it in tracks.values()])) and
+                (len(data['routes']) == 0 or all([len(it) < 2 for it in data['routes'].values()]))
+            ):
+                QMessageBox.warning(
+                    None,
+                    "Reading GPX file",
+                    "The GPX file contains no data or the only point"
+                )
+                return None
+            nonEmpty = [k for k, v in data.items() if v]
+            if (
+                len(nonEmpty) == 1 and
+                (
+                    nonEmpty[0] == 'waypoints' or
+                    (nonEmpty[0] == 'tracks' and len(tracks) == 1) or
+                    (nonEmpty[0] == 'routes' and len(data['routes']) == 1)
+                )
+            ):  # There is the only dataset
+                if nonEmpty[0] == 'waypoints':
+                    name = 'waypoints'
+                    lons = [it['lon'] for it in data['waypoints']]
+                    lats = [it['lat'] for it in data['waypoints']]
+                    eles = [it['ele'] for it in data['waypoints']]
+                elif nonEmpty[0] == 'routes':
+                    name = 'route'
+                    lons = [it['lon'] for it in data['routes'][0]]
+                    lats = [it['lat'] for it in data['routes'][0]]
+                    eles = [it['ele'] for it in data['routes'][0]]
+                else:    # nonEmpty[0] == 'tracks'
+                    name = 'track'
+                    lons = [it['lon'] for it in tracks[0]]
+                    lats = [it['lat'] for it in tracks[0]]
+                    eles = [it['ele'] for it in tracks[0]]
+                resampledData = self.smartProfile.getResamplingData(lons, lats, eles)
+                reply = QMessageBox.question(
+                    None,
+                    'Confirmation',
+                    ("The following data were found in the GPX-file:\n"
+                     f"  Type: {name} — Distance: {(resampledData['distances'][-1]) / 1000:.2f} km.\n"
+                     f"  Lacking elevation data: {(resampledData['nanRatio']) * 100:.2f} %.\n"
+                     f"  Maximum lacking gap: {(resampledData['maxDetectedGap']):.2f} m.\n\n"
+                    "Load this data?"),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    return name, resampledData
+                else:
+                    return None
+            else:   # Selection data from several datasets
+                datasets = []
+                for key in nonEmpty:
+                    if key == 'waypoints':
+                        lons = [it['lon'] for it in data['waypoints']]
+                        lats = [it['lat'] for it in data['waypoints']]
+                        eles = [it['ele'] for it in data['waypoints']]
+                        resampledData = self.smartProfile.getResamplingData(lons, lats, eles)
+                        datasets.append({
+                            'name': 'waypoints',
+                            'data': resampledData
+                        })
+                    elif key == 'routes':
+                        for vList in data['routes'].values():
+                            if len(vList) > 1:
+                                lons = []
+                                lats = []
+                                eles = []
+                                for it in vList:
+                                    lons.append(it['lon'])
+                                    lats.append(it['lat'])
+                                    eles.append(it['ele'])
+                                resampledData = self.smartProfile.getResamplingData(lons, lats, eles)
+                                datasets.append({
+                                    'name': 'route',
+                                    'data': resampledData
+                                })
+                    else:   # key == 'tracks'
+                        for vList in tracks.values():     # {track_id: [{"lat": float, "lon": float, "ele": float/None}, ...]}
+                            if len(vList) > 1:
+                                lons = []
+                                lats = []
+                                eles = []
+                                for it in vList:
+                                    lons.append(it['lon'])
+                                    lats.append(it['lat'])
+                                    eles.append(it['ele'])
+                                resampledData = self.smartProfile.getResamplingData(lons, lats, eles)
+                                datasets.append({
+                                    'name': 'track',
+                                    'data': resampledData
+                                })
+                if datasets:
+                    canvas = iface.mapCanvas()
+                    topLeftScreenPoint = canvas.mapToGlobal(canvas.pos())
+                    dlg = GPXDataSelectionDialog(datasets)
+                    dlg.move(topLeftScreenPoint)
+                    if dlg.exec() == QDialog.Accepted:
+                        resampledData = datasets[dlg.selectedData]['data']
+                        name = datasets[dlg.selectedData]['name']
+                        dlg.deleteLater()
+                        return name, resampledData
+                    else:
+                        dlg.deleteLater()
+            return None
+        except:
+            ex = "{0}".format(traceback.format_exc())
+            msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
+            print(f' renderBackground {msg}')
+            return None
 
     def enableActions(self):
         if self.smartProfile.spline is not None:
@@ -2936,6 +3987,51 @@ class EditTravelerDialog(QDialog):
         return data
 
 
+class GPXDataSelectionDialog(QDialog):
+    def __init__(self, data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Data selection from GPX")
+        self.setMinimumSize(400, 300)
+
+        # self.setWindowModality(Qt.ApplicationModal)
+
+        self.selectedData = None
+        self.listWidget = None
+        self.initUI(data)
+
+    def initUI(self, data):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("The following data were found in the GPX-file.\nSelect a dataset:"))
+        self.listWidget = QListWidget()
+        for index, route in enumerate(data):
+            itemText = (
+                f"{index + 1}. [{route['name'].upper()}] — Distance: {(route['data']['distances'][-1] / 1000):.2f} кm."
+                f" Lacking: {(route['data']['nanRatio']) * 100:.2f} %. "
+                f" Gap: {(route['data']['maxDetectedGap']):.1f} m."
+            )
+            item = QListWidgetItem(itemText)
+            item.setData(Qt.UserRole, index)
+            self.listWidget.addItem(item)
+        layout.addWidget(self.listWidget)
+        buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttonBox.accepted.connect(self.accept)
+        buttonBox.rejected.connect(self.reject)
+        layout.addWidget(buttonBox)
+        self.listWidget.itemDoubleClicked.connect(self.accept)
+
+    def accept(self):
+        currentItem = self.listWidget.currentItem()
+        if currentItem:
+            self.selectedData = currentItem.data(Qt.UserRole)
+        super().accept()
+
+    # if dialog.exec_() == QDialog.Accepted:
+    #     result = dialog.selected_route
+    #     print(f"Пользователь выбрал: {result}")
+    # else:
+    #     print("Выбор отменен")
+
+
 class LayerSelectDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3074,6 +4170,147 @@ class InfoDisplay(QFrame):
             # ex = "{0}".format(traceback.format_exc())
             # msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
             # print(f' renderBackground {msg}')
+
+
+class TravelerEdit(QFrame):
+    def __init__(self, data, limits):
+        super().__init__()
+        self.edits = {}
+        frameLayout = QVBoxLayout(self)
+        # ------- Name --------
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        editLine = QLineEdit()
+        editLine.setText(str(data['name']))
+        title = QLabel('Name: ')
+        block.addWidget(title)
+        block.addWidget(editLine)
+        frameLayout.addWidget(container, stretch=1)
+        self.edits['name'] = editLine
+        # ------- Gender --------
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        selectedGroup = QGroupBox()
+        layout = QHBoxLayout(selectedGroup)
+        radioMale = QRadioButton('Male')
+        radioFemale = QRadioButton('Female')
+        genderGroup = QButtonGroup(self)
+        genderGroup.addButton(radioMale, 0)
+        genderGroup.addButton(radioFemale, 1)
+        if data['gender']:  # Male - 0 (False), Female - 1 (True)
+            radioFemale.setChecked(True)
+            radioMale.setChecked(False)
+        else:
+            radioFemale.setChecked(False)
+            radioMale.setChecked(True)
+        layout.addWidget(radioMale)
+        layout.addWidget(radioFemale)
+        selectedGroup.setLayout(layout)
+        title = QLabel('Gender: ')
+        block.addWidget(title)
+        block.addWidget(selectedGroup)
+        frameLayout.addWidget(container, stretch=1)
+        self.edits['gender'] = genderGroup
+        # ------- Age --------
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        editLine = QDoubleSpinBox()
+        editLine.setMinimum(limits['age'][0])
+        editLine.setMaximum(limits['age'][1])
+        editLine.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
+        editLine.setDecimals(0)
+        editLine.setValue(data['age'])
+        title = QLabel(f"Age ({limits['age'][0]} - {limits['age'][1]}) years: ")
+        block.addWidget(title)
+        block.addWidget(editLine)
+        frameLayout.addWidget(container, stretch=1)
+        self.edits['age'] = editLine
+        # ------- Weight --------
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        editLine = QDoubleSpinBox()
+        editLine.setMinimum(limits['weight'][0])
+        editLine.setMaximum(limits['weight'][1])
+        editLine.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
+        editLine.setDecimals(1)
+        editLine.setValue(data['weight'])
+        title = QLabel(f"Weight ({limits['weight'][0]} - {limits['weight'][1]}) kg: ")
+        block.addWidget(title)
+        block.addWidget(editLine)
+        frameLayout.addWidget(container, stretch=1)
+        self.edits['weight'] = editLine
+        # ------- Height --------
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        editLine = QDoubleSpinBox()
+        editLine.setMinimum(limits['height'][0])
+        editLine.setMaximum(limits['height'][1])
+        editLine.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
+        editLine.setDecimals(1)
+        editLine.setValue(data['height'])
+        title = QLabel(f"Height ({limits['height'][0]} - {limits['height'][1]}) cm: ")
+        block.addWidget(title)
+        block.addWidget(editLine)
+        frameLayout.addWidget(container, stretch=1)
+        self.edits['height'] = editLine
+        # ------- Speed --------
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        editLine = QDoubleSpinBox()
+        editLine.setMinimum(limits['speed'][0])
+        editLine.setMaximum(limits['speed'][1])
+        editLine.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
+        editLine.setDecimals(1)
+        editLine.setValue(data['speed'])
+        title = QLabel(f"Speed ({limits['speed'][0]} - {limits['speed'][1]}) km/h: ")
+        block.addWidget(title)
+        block.addWidget(editLine)
+        frameLayout.addWidget(container, stretch=1)
+        self.edits['speed'] = editLine
+        # ------- Cargo --------
+        container = QFrame()
+        block = QHBoxLayout(container)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(2)
+        editLine = QDoubleSpinBox()
+        editLine.setMinimum(limits['cargo'][0])
+        editLine.setMaximum(limits['cargo'][1])
+        editLine.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
+        editLine.setDecimals(1)
+        editLine.setValue(data['cargo'])
+        title = QLabel(f"Cargo ({limits['cargo'][0]} - {limits['cargo'][1]}) kg: ")
+        block.addWidget(title)
+        block.addWidget(editLine)
+        frameLayout.addWidget(container, stretch=1)
+        self.edits['cargo'] = editLine
+
+    def getData(self):
+        keys = ["name", "gender", "age", "weight", "height", "speed", "cargo"]
+        if not all(k in keys for k in self.edits):
+            return None
+        data = {}
+        for key, it in self.edits.items():
+            data[key] = {
+                "age": int(it.value()),
+                "gender": True if it.checkedId() else False,
+                "weight": float(it.value()),
+                "height": int(it.value()),
+                "speed": float(it.value()),
+                "cargo": float(it.value())
+            }[key]
+        return data
 
 
 class ConditionsDisplay(QFrame):
