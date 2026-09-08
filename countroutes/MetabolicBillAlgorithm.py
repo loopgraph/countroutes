@@ -23,12 +23,15 @@ from scipy.interpolate import CubicSpline, UnivariateSpline, interp1d
 from scipy.signal import savgol_filter
 from scipy.ndimage import median_filter
 from scipy.optimize import minimize_scalar
+import math
 import pyproj
 import scipy.optimize as opt
 
 # Constants and limitations
 DISTANCE_STEP = 10
-MINIMAL_DISTANCE = 10
+MINIMAL_DISTANCE = 100
+MAXIMAL_DISTANCE = 100000
+WEATHER_STEP = 14000
 SLOPE_LIMIT = (-0.45, 0.45)
 ELEVATION_LIMIT = (-450, 9000)
 TERRAIN_COEFFS = [
@@ -42,6 +45,7 @@ TERRAIN_COEFFS = [
 TEMPERATURES_LIMIT = (-40, 50)
 HUMIDITY_LIMIT = (0.0, 1.0)
 G = 9.81
+# Using GEOD for calculating distance between two points with lon and lat
 GEOD = pyproj.Geod(ellps='WGS84')
 KCAL_TO_JOULES = 4184   # 1 ккал = 4184 Дж
 CARBS_TO_GRAMM = 1 / 4.1    # 1 ккал = 1/4.1 г
@@ -137,50 +141,138 @@ def prepareElevationData(
 def resampling(lons, lats, eles=None):
     """
     Resampling accounting for Earth's curvature distortion and the 180th meridian problem
+    :param lons: The list of longitudes (float)
+    :param lats: The list of latitudes (float)
+    :param eles: The list of elevations (float)
+    :return: resamplingData = {
+        'realStep': float,
+        'distances': numpy array,
+        'lons': numpy array,
+        'lats': numpy array,
+        'eles': numpy array,
+        'nanRatio': float,
+        'maxDetectedGap': float
+    }
     """
-    resamplingData = {
-        'realStep': None,
-        'distances': np.array([]),
-        'lons': np.array([]),
-        'lats': np.array([]),
-        'eles': np.array([]),
-        'nanRatio': None,
-        'maxDetectedGap': None
+    emptyResamplingData = {
+        'realStep': None
     }
     if (lons is None or lats is None or
             not isinstance(lons, list) or not isinstance(lats, list) or
             len(lons) < 2 or len(lats) < 2 or len(lons) != len(lats)):
-        return resamplingData
-    # Converting lists to NumPy arrays
-    lonsArr = np.array(lons)
-    latsArr = np.array(lats)
-    elesArr = np.asarray(eles, dtype=float) if eles is not None and len(eles) == len(lons) else []
-    totalElements = len(elesArr)
-    nanRatio = 1
-    isNan = None
-    if totalElements:
-        isNan = np.isnan(elesArr)
-        nanRatio = np.sum(isNan) / totalElements
-        elesFilled = elesArr.copy()
-        xIndices = np.arange(len(elesArr))
-        elesFilled[isNan] = np.interp(xIndices[isNan], xIndices[~isNan], elesArr[~isNan])
-    else:
-        elesFilled = None
-    segmentDistances = vincentyDistance(lonsArr[:-1], latsArr[:-1], lonsArr[1:], latsArr[1:])
-    # print(f'resampling: segmentDistances = {segmentDistances}')
-    # distances = np.concatenate(([0.0], np.cumsum(segmentDistances)))
-    distances = np.insert(np.cumsum(segmentDistances), 0, 0.0)
-    totalLength = distances[-1]
-    if totalLength < MINIMAL_DISTANCE:
-        return resamplingData
-    # Calculation of the precise adjusted step
-    numSegments = round(totalLength / DISTANCE_STEP)
-    if numSegments == 0:
-        numSegments = 1
-    realStep = totalLength / numSegments
+        return emptyResamplingData
+    try:
+        # Converting lists to NumPy arrays
+        lonsArr = np.array(lons)
+        latsArr = np.array(lats)
+        elesArr = np.asarray(eles, dtype=float) if eles is not None and len(eles) == len(lons) else []
+        totalElements = len(elesArr)
+        nanRatio = 1
+        isNan = None
+        if totalElements:
+            isNan = np.isnan(elesArr)
+            nanRatio = np.sum(isNan) / totalElements
+            elesFilled = elesArr.copy()
+            xIndices = np.arange(len(elesArr))
+            elesFilled[isNan] = np.interp(xIndices[isNan], xIndices[~isNan], elesArr[~isNan])
+        else:
+            elesFilled = None
+        segmentDistances = vincentyDistance(lonsArr[:-1], latsArr[:-1], lonsArr[1:], latsArr[1:])
+        # print(f'resampling: segmentDistances = {segmentDistances}')
+        # distances = np.concatenate(([0.0], np.cumsum(segmentDistances)))
+        distances = np.insert(np.cumsum(segmentDistances), 0, 0.0)
+        totalLength = distances[-1]
+        if totalLength < MINIMAL_DISTANCE or totalLength > MAXIMAL_DISTANCE:
+            return emptyResamplingData
+        # Calculation of the precise adjusted step
+        numSegments = round(totalLength / DISTANCE_STEP)
+        if numSegments == 0:
+            numSegments = 1
+        realStep = totalLength / numSegments
+        numPoints = numSegments + 1
+        # Creating a new uniform grid based on distance
+        targetDistances = np.linspace(0, totalLength, numPoints)
+        # Converting latitude and longitude to radians
+        latsRad = np.radians(latsArr)
+        lonsRad = np.radians(lonsArr)
+        # Conversion to 3D Cartesian coordinates (on the unit sphere)
+        x = np.cos(latsRad) * np.cos(lonsRad)
+        y = np.cos(latsRad) * np.sin(lonsRad)
+        z = np.sin(latsRad)
+        # Uniform interpolation of X, Y, Z, and elevation
+        newX = np.interp(targetDistances, distances, x)
+        newY = np.interp(targetDistances, distances, y)
+        newZ = np.interp(targetDistances, distances, z)
+        newEles = np.interp(targetDistances, distances, elesFilled) if elesFilled is not None else np.array([])
+        # Vector normalization (returning to the surface of the sphere)
+        norms = np.sqrt(newX ** 2 + newY ** 2 + newZ ** 2)
+        newX /= norms
+        newY /= norms
+        newZ /= norms
+        # Reverse conversion to latitude and longitude (in degrees)
+        newLats = np.degrees(np.arcsin(newZ))
+        newLons = np.degrees(np.arctan2(newY, newX))
+        # Processing elevation discontinuities
+        maxDetectedGap = 0
+        if nanRatio != 1 and isNan is not None and np.any(isNan):
+            # Adding False at the edges for correct boundary tracking
+            padded = np.diff(np.concatenate(([False], isNan, [False])))
+            # Start and end indices of NaN blocks within the elesArr array
+            starts = np.where(padded == 1)[0]
+            ends = np.where(padded == -1)[0] - 1  # -1, because np.diff shifts the end index
+            # Determine the indices of the "healthy" points around the discontinuity
+            # Point BEFORE the break (bounded below by zero)
+            leftIndices = np.maximum(0, starts - 1)
+            # Point AFTER the break (upper bound limited by the end of the array)
+            rightIndices = np.minimum(totalElements - 1, ends + 1)
+            # Calculating the physical length of each gap based on the array of distances
+            gapDistances = targetDistances[rightIndices] - targetDistances[leftIndices]
+            maxDetectedGap = np.max(gapDistances)
+        return {
+            'realStep': realStep,
+            'distances': targetDistances,
+            'lons': newLons,
+            'lats': newLats,
+            'eles': newEles,
+            'nanRatio': nanRatio,
+            'maxDetectedGap': maxDetectedGap
+        }
+    except:
+        return emptyResamplingData
+
+
+def buildEtaData(distances, etaSegments=None):
+    if len(distances) == 0:
+        return [], np.array([])
+    try:
+        if etaSegments is None:     # New eta segments
+            etaSegments = [[0.0, 1.0, float(DEFAULT_ETA)]]
+        etaArray = np.full_like(distances, DEFAULT_ETA, dtype=float)
+        for start, end, eta in etaSegments:
+            mask = (distances >= start * distances[-1]) & (distances <= end * distances[-1])
+            etaArray[mask] = eta
+        return etaSegments, etaArray
+    except:
+        return [], np.array([])
+
+
+def createTargetPoints(distances, lonsArr, latsArr, targetStep=WEATHER_STEP, minimalPoints=3):
+    if len(distances) == 0:
+        return {
+            'realStep': 0.0,
+            'distances': np.array([]),
+            'lons': np.array([]),
+            'lats': np.array([]),
+            'temps': np.array([]),
+            'hums': np.array([])
+        }
+    totalLength = distances[-1] - distances[0]
+    numSegments = np.floor(totalLength / targetStep)
+    minimalPoints = minimalPoints if minimalPoints > 1 else 2
+    if numSegments < minimalPoints - 1:
+        numSegments = minimalPoints - 1
     numPoints = numSegments + 1
-    # Creating a new uniform grid based on distance
-    targetDistances = np.linspace(0, totalLength, numPoints)
+    newDistances = np.linspace(distances[0], distances[-1], numPoints)
     # Converting latitude and longitude to radians
     latsRad = np.radians(latsArr)
     lonsRad = np.radians(lonsArr)
@@ -188,11 +280,10 @@ def resampling(lons, lats, eles=None):
     x = np.cos(latsRad) * np.cos(lonsRad)
     y = np.cos(latsRad) * np.sin(lonsRad)
     z = np.sin(latsRad)
-    # Uniform interpolation of X, Y, Z, and elevation
-    newX = np.interp(targetDistances, distances, x)
-    newY = np.interp(targetDistances, distances, y)
-    newZ = np.interp(targetDistances, distances, z)
-    newEles = np.interp(targetDistances, distances, elesFilled) if elesFilled is not None else []
+    # Uniform interpolation of X, Y, Z
+    newX = np.interp(newDistances, distances, x)
+    newY = np.interp(newDistances, distances, y)
+    newZ = np.interp(newDistances, distances, z)
     # Vector normalization (returning to the surface of the sphere)
     norms = np.sqrt(newX ** 2 + newY ** 2 + newZ ** 2)
     newX /= norms
@@ -201,32 +292,17 @@ def resampling(lons, lats, eles=None):
     # Reverse conversion to latitude and longitude (in degrees)
     newLats = np.degrees(np.arcsin(newZ))
     newLons = np.degrees(np.arctan2(newY, newX))
-    # Processing elevation discontinuities
-    maxDetectedGap = 0
-    if nanRatio != 1 and isNan is not None and np.any(isNan):
-        # Adding False at the edges for correct boundary tracking
-        padded = np.diff(np.concatenate(([False], isNan, [False])))
-        # Start and end indices of NaN blocks within the elesArr array
-        starts = np.where(padded == 1)[0]
-        ends = np.where(padded == -1)[0] - 1  # -1, because np.diff shifts the end index
-        # Determine the indices of the "healthy" points around the discontinuity
-        # Point BEFORE the break (bounded below by zero)
-        leftIndices = np.maximum(0, starts - 1)
-        # Point AFTER the break (upper bound limited by the end of the array)
-        rightIndices = np.minimum(totalElements - 1, ends + 1)
-        # Calculating the physical length of each gap based on the array of distances
-        gapDistances = targetDistances[rightIndices] - targetDistances[leftIndices]
-        maxDetectedGap = np.max(gapDistances)
-    resamplingData = {
-        'realStep': realStep,
-        'distances': targetDistances,
+    calculatedStep = totalLength / numSegments
+    temps = np.full(len(newDistances), DEFAULT_TEMPERATURE, dtype=float)
+    hums = np.full(len(newDistances), DEFAULT_HUMIDITY, dtype=float)
+    return {
+        'realStep': calculatedStep,
+        'distances': newDistances,
         'lons': newLons,
         'lats': newLats,
-        'eles': newEles,
-        'nanRatio': nanRatio,
-        'maxDetectedGap': maxDetectedGap
+        'temps': temps,
+        'hums': hums
     }
-    return resamplingData
 
 
 def vincentyDistance(lon1, lat1, lon2, lat2):
@@ -235,7 +311,11 @@ def vincentyDistance(lon1, lat1, lon2, lat2):
     return distance
 
 
-def profileSmoothing(distances, elevations, isSteepSlope=False):
+def profileSmoothing(distances, elevations, defaultElevation, isSteepSlope=True):
+    if len(distances) == 0:
+        return np.array([]), np.array([])
+    if len(elevations) == 0:
+        elevations = np.full_like(distances, defaultElevation, dtype=float)
     totalLength = distances[-1]
     numPoints = len(distances)
     # Selecting a fixed filtering window based on the route length
@@ -561,7 +641,7 @@ def prepareEnergyData(
         """
 
         altFactor = 1.0 + max(0.0, (altitude - 1500) / 1000) * 0.06
-        tempFactor = 1.0 + (temp - 25) * 0.005 if temp > 25 else (1.0 + (10 - temp) * 0.007 if temp < 10 else 1.0)
+        tempFactor = (1.0 + (temp - 25) * 0.005) if temp > 25 else (1.0 + (10 - temp) * 0.007 if temp < 10 else 1.0)
 
         # 6. Уравнение Ладлоу-Вейанда (2017)
         # Учитываем, что нагрузка (рюкзак) увеличивает метаболическую стоимость базы
@@ -609,12 +689,16 @@ def prepareEnergyData(
         #   на основе интенсивности (через расход ккал/м)
         #   0.04 ккал/м - прогулка (30% углеводов), 0.12 ккал/м - тяжелый подъем (90% углеводов)
         #   Линейная аппроксимация Коэффициента дыхательного обмена RER (Respiratory Exchange Ratio)
+        # !!! Безопасный вариант (с использованием встроенного ограничения интерполяции)
+        #carb_ratio = np.interp(kcalPerMeter, [0.035, 0.15], [0.35, 0.95], left=0.35, right=0.95)
         carbRatio = np.interp(kcalPerMeter, [0.035, 0.15], [0.35, 0.95])
         # Границы [0.035, 0.15] для kcalPerMeter и [0.35, 0.95] для доли углеводов создают «безопасный коридор».
         # Если kcalPerMeter упадет ниже 0.035, carbRatio останется 0.35
         #   (базовый метаболизм/медленная ходьба, где горят в основном жиры).
         # Если kcalPerMeter превысит 0.15, carbRatio зафиксируется на 0.95
         #   (анаэробный порог, где горят почти только углеводы).
+        # !!! В 1 грамме углеводов содержится ровно 4.1 ккал энергии
+        # currentGlycogen -= (kcalPerMeter * carbRatio * deltaX) / 4.1
         currentGlycogen -= (kcalPerMeter * carbRatio * deltaX)
 
         # Расчет критического обезвоживания (Sweat Rate) литров в час
@@ -859,5 +943,302 @@ def prepareEnergyData(
         speedMax,
         rechargesPlan
     )
+
+
+def getBaseGlycogen(weightKg, heightCm, ageYrs, isFemale=True):
+    bmi = weightKg / ((heightCm / 100) ** 2)
+    """
+        agePivot = 25           # После 25 лет удерживание мышцами гликогена снижается          
+        baseFactor = 5.8        # 5.8 г гликогена на 1 кг веса для мужчин
+        baseFactor = 4.5        # ~4.5 г гликогена на 1 кг веса (меньше мышц) для женщин
+        idealBmi = 22.5         # Эталон ИМТ для мужчин
+        idealBmi = 21.5         # Эталон ИМТ для женщин
+        bmiUnder = 0.03         # Штраф за дефицит веса для мужчин
+        bmiUnder = 0.035        # Женский организм сильнее теряет мышцы при истощении
+        bmiOver = 0.025         # Штраф за избыточный вес (жир) для мужчин
+        bmiOver = 0.022         # Штраф за избыточный вес для женщин
+        ageFactor = 0.005       # Штраф за каждый год после 25 лет для мужчин
+        ageFactor = 0.006       # Для женщин чуть выше из-за гормонального профиля
+    """
+    if not isFemale:
+        agePivot, baseFactor, idealBmi, bmiUnder, bmiOver, ageFactor = 25, 5.8, 22.5, 0.03, 0.025, 0.005
+    else:
+        agePivot, baseFactor, idealBmi, bmiUnder, bmiOver, ageFactor = 25, 4.5, 21.5, 0.035, 0.022, 0.006
+    agePenalty = max(0, (ageYrs - agePivot) * ageFactor)
+    bmiPenalty = (idealBmi - bmi) * bmiUnder if bmi < idealBmi else (bmi - idealBmi) * bmiOver
+    fitnessPenalty = np.clip(bmiPenalty + agePenalty, 0, 0.4)
+    baseGlycogen = weightKg * baseFactor * (1 - fitnessPenalty)
+    return float(baseGlycogen)
+
+
+def routeExpenditure(
+        distances,  # NumPy-массив: кумулятивные расстояния (размер N)
+        elevations,  # NumPy-массив: высоты точек (размер N)
+        weight,     # kg
+        height,     # cm
+        age,  # years
+        massPackKg,   # kg
+        etaFactor,
+        tempFactor,
+        altFactor=1.0,
+        speedTarget=None,   # m/s
+        isFemale=False,
+        isStoped=True  # Режим: True (бросить маршрут) или False (учесть только покой)
+):
+
+    # --- 1. РАСЧЕТ ИНТЕРВАЛОВ И УКЛОНОВ ---
+    dx = np.diff(distances)
+    dh = np.diff(elevations)
+    dxSafe = np.where(dx == 0, 1e-5, dx)
+    slopes = dh / dxSafe
+
+    # --- 2. БАЗОВЫЙ РАСЧЕТ BMR (Миффлин-Сан Жеор) - adjustedBmr ---
+    if not isFemale:
+        bmrKcal = 10 * weight + 6.25 * height - 5 * age + 5
+    else:
+        bmrKcal = 10 * weight + 6.25 * height - 5 * age - 161
+    # Коэффициент 0.0484 переводит ккал/сутки в Вт на единицу массы (ккал/сут -> Дж/сек -> / вес)
+    pBmr = (bmrKcal * 0.0484) / weight
+    adjustedBmr = pBmr * altFactor * tempFactor
+
+    # --- 3. АДАПТАЦИЯ СКОРОСТИ ПО ТОБЛЕРУ ---
+    vToblerMax = (6.0 * np.exp(-3.5 * np.abs(slopes + 0.05))) / 3.6
+    packFactor = np.exp(-0.008 * massPackKg)
+    vLimit = vToblerMax * packFactor
+
+    if speedTarget is None:
+        vReal = vLimit
+    else:
+        vReal = np.minimum(speedTarget, vLimit)
+
+    # Определяем маску непреодолимых участков (где скорость физически ниже 0.1 м/с)
+    isObstacle = vReal < 0.1
+
+    # --- 4. ОБРАБОТКА РЕЖИМОВ ПРЕПЯТСТВИЙ ---
+    if isStoped:
+        # Находим индекс первого препятствия
+        obstacleIndices = np.where(isObstacle)[0]
+
+        if len(obstacleIndices) > 0:
+            firstObsIdx = obstacleIndices[0]
+
+            # Начиная с первого препятствия, все оставшиеся скорости равны 0
+            vReal[firstObsIdx:] = 0.0
+
+            # Энергия на интервалах до препятствия считается нормально
+            # А начиная с препятствия и до конца — затраты неизвестны (NaN)
+            energyPerIntervalMask = np.ones_like(vReal, dtype=float)
+            energyPerIntervalMask[firstObsIdx:] = np.nan
+        else:
+            energyPerIntervalMask = np.ones_like(vReal, dtype=float)
+
+    else:
+        # Если перепрыгиваем, то на месте препятствия скорость строго 0
+        vReal = np.where(isObstacle, 0.0, vReal)
+        energyPerIntervalMask = np.ones_like(vReal, dtype=float)
+
+    # Скорость для безопасного деления (чтобы не делить на 0 на препятствиях)
+    # На препятствии при режиме 'skip' человек движется условно очень медленно ("просачивается")
+    vSafe = np.where(isObstacle, 1e-3, vReal)
+
+    # --- 5. ВЫЧИСЛЕНИЕ ЧИСЛА ФРУДА И РЕЖИМА ДВИЖЕНИЯ ---
+    L = (height / 100.0) * 0.53
+    g = 9.81
+    Fr = (vReal ** 2) / (g * L)
+
+    # --- 6. РАСЧЕТ ДОБАВОЧНОЙ МЕТАБОЛИЧЕСКОЙ МОЩНОСТИ (Ходьба vs Бег) ---
+    loadMetabolicModifier = (weight + massPackKg) / weight
+
+    # Векторный расчет для ходьбы
+    vMPerMin = vReal * 60
+    vo2WalkHoriz = 0.0003 * (vMPerMin ** 2) - 0.02 * vMPerMin + 4.2
+    netVo2Walk = np.maximum(0.0, vo2WalkHoriz - 3.5)
+    pMoveHorizWalk = netVo2Walk * 0.335
+    slopeCostWalk = 0.16 * vReal * np.where(slopes >= 0, slopes, np.maximum(slopes, -0.08))
+    pWalkTotal = pMoveHorizWalk + slopeCostWalk
+
+    # Векторный расчет для бега
+    netRunningCostPerMeter = 3.6 + 0.01 * (vReal ** 2)
+    pMoveHorizRun = netRunningCostPerMeter * vReal
+    slopeCostRun = 0.20 * vReal * np.where(slopes >= 0, slopes, np.maximum(slopes, -0.08))
+    pRunTotal = pMoveHorizRun + slopeCostRun
+
+    # Базовая интеграция мощностей движения на основе маски числа Фруда
+    pMove = np.where(Fr <= 0.5, pWalkTotal, pRunTotal)
+    # ЕСЛИ ПРЕПЯТСТВИЕ, добавочная мощность движения (pMove) обнуляется! Мышечной работы нет.
+    pMove = np.where(isObstacle, 0.0, pMove)
+
+    pMoveAdjusted = pMove * loadMetabolicModifier * etaFactor
+
+    # Полная мощность: на препятствии она будет равна строго adjustedBmr (энергия покоя)
+    pMetabolicTotal = adjustedBmr + pMoveAdjusted
+
+    # --- 7. РАСЧЕТ ЭНЕРГИИ НА ИНТЕРВАЛ И КУМУЛЯТИВНОЙ СУММЫ ---
+    totalMass = weight + massPackKg
+    totalWattsMetabolic = pMetabolicTotal * weight
+
+    # Метаболическая энергия на 1 метр
+    energyMetabolicPerMeter = totalWattsMetabolic * (1.0 / vSafe)
+
+    # Работа против гравитации (на препятствии механической работы против гравитации нет, человек стоит)
+    workGravityPerMeter = np.where(isObstacle, 0.0, totalMass * g * slopes)
+
+    # Полная энергия на метр
+    energyTotalPerMeter = energyMetabolicPerMeter + np.maximum(0.0, workGravityPerMeter)
+
+    # Энергозатраты на интервал с учетом маски сценария 'stop'
+    energyPerInterval = energyTotalPerMeter * dx * energyPerIntervalMask
+
+    # Считаем кумулятивную (накапливаемую) сумму затрат энергии
+    # Если в массиве есть NaN (сценарий 'stop'), cumsum автоматически сделает все последующие элементы NaN
+    # Добавляем 0 в начало, чтобы массив совпадал по размеру с исходными точками трека
+    cumulativeEnergyJoules = np.concatenate(([0.0], np.cumsum(energyPerInterval)))
+    # Массив скоростей дополняем последним значением для совпадения размерности с точками трека
+    speedsMs = np.concatenate((vReal, [vReal[-1]]))
+
+    return speedsMs, cumulativeEnergyJoules
+
+
+def rechargingPlan(
+        distances,      # NumPy-массив: кумулятивные расстояния (размер N)
+        elevations,     # NumPy-массив: высоты точек (размер N)
+        weight,         # kg
+        height,         # cm
+        age,  # years
+        massPackKg,     # kg
+        speeds,         # NumPy-массив: кумулятивные расстояния (размер N)
+        energiesKj,
+        temperature,
+        humidity,
+        isFemale=True
+):
+    """
+    The primary method for simulation and developing a hydration/nutrition plan.
+    """
+    # Физиологические константы
+    DRINK_TRIGGER_ML = weight * 0.01 * 1000  # Жажда при потере 1% веса
+    COMPENSATION_FACTOR = 1.25
+    MAX_SINGLE_DRINK_ML = 350   # Лимит объема желудка за раз
+
+    maxGlycogen = getBaseGlycogen(weight, height, age, isFemale)
+
+    # Переменные состояния организма
+    currentGlycogen = maxGlycogen
+    accumulatedFluidDeficit = 0.0
+    totalTimeSeconds = 0.0
+
+    # Буфер усвоения углеводов из ЖКТ (г)
+    carbsInStomach = 0.0
+
+    # Выходные массивы
+    telemetryLog = []
+    actionPlan = []
+
+    # Пошаговый проход по ресемплированному треку
+    for i in range(1, len(distances)):
+        # Расчет дельт на микро-участке
+        dx = distances[i] - distances[i - 1]
+        if dx <= 0: continue
+
+        dz = elevations[i] - elevations[i - 1]
+        slope = dz / dx
+
+        v = speeds[i]
+        if v <= 0: v = 0.5  # Защита от деления на ноль, если турист завис
+        dt = dx / v
+        totalTimeSeconds += dt
+
+        # Энергия участка (из кДж в ккал)
+        dEnrgKj = energiesKj[i] - energiesKj[i - 1]
+        dEnrgKcal = dEnrgKj / 4.184
+        kcalPerMeter = dEnrgKcal / dx
+        energyWm = (dEnrgKj * 1000) / dx  # Вт/м (Дж/м)
+        powerWatts = dEnrgKj * 1000 / dt  # Чистая мощность в Ваттах
+
+        # 2. Динамическое определение доли углеводов в зависимости от интенсивности
+        # При низкой нагрузке горит жир, при высокой — преимущественно гликоген
+        # carbRatio = 0.35    - 35% углеводы, 65% жиры (неторопливый шаг по равнине)
+        # carbRatio = 0.55    - 55% углеводы, 45% жиры (стандартный трекинг с рюкзаком)
+        # carbRatio = 0.85    - 85% углеводы, 15% жиры (крутой подъем, штурм, бег)
+        # carbRatio = 0.55    - Дефолтное значение
+        # Безопасный вариант (с использованием встроенного ограничения интерполяции)
+        carbRatio = np.interp(kcalPerMeter, [0.035, 0.15], [0.35, 0.95], left=0.35, right=0.95)
+
+        # 3. Расход и усвоение гликогена
+        # Энергетическая ценность 1 г углеводов = 4.1 ккал
+        glycogenSpentG = dEnrgKcal * carbRatio / 4.1
+
+        # Усвоение из желудка в мышцы (не более 1 г углеводов в минуту)
+        carbsAbsorbedG = min(carbsInStomach, (dt / 60.0) * 1.0)
+        carbsInStomach -= carbsAbsorbedG
+
+        # Эндогенная вода из гликогена
+        currentGlycogen = np.clip(currentGlycogen - glycogenSpentG + carbsAbsorbedG, 0, maxGlycogen)
+        metabolicWaterFreedMl = glycogenSpentG * 3.5
+
+        # 4. Расчет потерь жидкости во времени (пот + дыхание)
+        baseSweatRate = 50.0 + (powerWatts * 1.5)
+        tempMod = 1.0 + (temperature - 20.0) * 0.07 if temperature > 20 else 1.0 + (temperature - 20.0) * 0.02
+        humMod = 1.0 + (humidity - 50.0) * 0.005 if humidity > 50 else 1.0
+        sweatRateHr = np.clip(baseSweatRate * tempMod * humMod, 50.0, 2000.0)
+        respRateHr = 30.0 + (powerWatts * 0.15)
+        grossLossMl = ((sweatRateHr + respRateHr) / 3600.0) * dt
+        netIntervalDeficit = max(0.0, grossLossMl - metabolicWaterFreedMl)
+        accumulatedFluidDeficit += netIntervalDeficit
+
+        # Сохранение текущей телеметрии
+        timeMin = totalTimeSeconds / 60.0
+        telemetryLog.append({
+            "distance_m": distances[i],
+            "timeMin": timeMin,
+            "glycogen_g": currentGlycogen,
+            "fluid_deficit_ml": accumulatedFluidDeficit
+        })
+
+        # 5. Проверка триггера водопоя и питания
+        # Пьем при достижении порога или если гликоген упал ниже 30% (нужна срочная подпитка изотоником)
+        if accumulatedFluidDeficit >= DRINK_TRIGGER_ML or (
+                currentGlycogen < maxGlycogen * 0.3 and timeMin % 15 < 1):
+            targetDrinkMl = accumulatedFluidDeficit * COMPENSATION_FACTOR
+            actualDrinkMl = min(targetDrinkMl,
+                                  MAX_SINGLE_DRINK_ML) if accumulatedFluidDeficit >= DRINK_TRIGGER_ML else 200
+
+            # Если дефицит маленький, но упал гликоген, делаем поддерживающий глоток
+            actualDrinkMl = max(150, min(actualDrinkMl, MAX_SINGLE_DRINK_ML))
+
+            # Расчет пропорций напитков (ORS, Изотоник, Вода)
+            saltRatio = np.interp(temperature, [20.0, 35.0], [0.10, 0.20], left=0.10, right=0.20)
+            isotonicRatio = 0.55 if currentGlycogen < maxGlycogen * 0.7 else 0.40
+            pureWaterRatio = max(0.10, 1.0 - (isotonicRatio + saltRatio))
+
+            isotonicMl = actualDrinkMl * isotonicRatio
+            orsMl = actualDrinkMl * saltRatio
+            waterMl = actualDrinkMl * pureWaterRatio
+
+            # Расчет поступивших углеводов из 8% изотоника (8 г на 100 мл)
+            carbsIngestedG = (isotonicMl / 100.0) * 8.0
+            carbsInStomach += carbsIngestedG
+
+            actionPlan.append({
+                "timeAfterStartMin": round(timeMin, 1),
+                "distanceM": round(distances[i]),
+                "totalFluidMl": round(actualDrinkMl),
+                "isotonic8Ml": round(isotonicMl),
+                "orsSolutionMl": round(orsMl),
+                "pureWaterMl": round(waterMl),
+                "carbsAddedG": round(carbsIngestedG),
+                "glycogenBeforeG": round(currentGlycogen)
+            })
+
+            # Корректируем дефицит после питья
+            accumulatedFluidDeficit = max(
+                0.0,
+                accumulatedFluidDeficit - (actualDrinkMl / COMPENSATION_FACTOR)
+            )
+
+    return actionPlan, telemetryLog
+
+
+
 
 
