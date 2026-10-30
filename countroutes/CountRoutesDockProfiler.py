@@ -2326,11 +2326,12 @@ class SelectableMenu(QMenu):
 
     def getRemovableKeys(self):
         return [action.data() for action in self.actions()
-                if (
-                        isinstance(action, QWidgetAction) and
-                        isinstance(action.defaultWidget(), SelectableMenuWidget) and
-                        action.defaultWidget().isRemovable
-                )]
+                    if (
+                            isinstance(action, QWidgetAction) and
+                            isinstance(action.defaultWidget(), SelectableMenuWidget) and
+                            action.defaultWidget().isRemovable
+                    )
+                ]
 
     def addComplexAction(self, name, key, selectMethod, removeMethod):
         if self.defaultKey is not None and key == self.defaultKey:
