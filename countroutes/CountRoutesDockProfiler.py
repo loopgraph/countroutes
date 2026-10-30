@@ -2318,7 +2318,21 @@ class SelectableMenu(QMenu):
             self.removeAction(self.softSeparator)
         self.softSeparator = self.addSeparator()
 
-    def addBioMetrics(self, name, key, selectMethod, removeMethod):
+    def getActionByKey(self, key):
+        return {action.data(): action for action in self.actions()}.get(key, None)
+
+    def isKeyInActions(self, key):
+        return key in {action.data() for action in self.actions()}
+
+    def getRemovableKeys(self):
+        return [action.data() for action in self.actions()
+                if (
+                        isinstance(action, QWidgetAction) and
+                        isinstance(action.defaultWidget(), SelectableMenuWidget) and
+                        action.defaultWidget().isRemovable
+                )]
+
+    def addComplexAction(self, name, key, selectMethod, removeMethod):
         if self.defaultKey is not None and key == self.defaultKey:
             widget = SelectableMenuWidget(name, isEdited=True)
         else:
@@ -2338,29 +2352,25 @@ class SelectableMenu(QMenu):
         if self.currentKey is not None and key == self.currentKey:
             return
         elif self.currentKey is not None:
-            for action in self.actions():
-                if action.data() == self.currentKey:
-                    widget = action.defaultWidget()
-                    widget.setSelected(False)
-                    self.currentKey = None
-                    break
-        for action in self.actions():
-            if action.data() == key:
-                widget = action.defaultWidget()
-                widget.setSelected(True)
-                self.currentKey = key
-                return
+            curAction = self.getActionByKey(self.currentKey)
+            if curAction is not None:
+                widget = curAction.defaultWidget()
+                widget.setSelected(False)
+                self.currentKey = None
+        action = self.getActionByKey(key)
+        if action is not None:
+            widget = action.defaultWidget()
+            widget.setSelected(True)
+            self.currentKey = key
 
     def deleteRemovableAction(self, key):
-        if key is not None and key != self.defaultKey:
-            for action in self.actions():
-                if action.data() == key:
-                    if action.defaultWidget().isRemovable:
-                        if self.currentKey == key:
-                            self.currentKey = None
-                        self.removeAction(action)
-                        action.deleteLater()
-                    break
+        if key is not None and (self.defaultKey is None or key != self.defaultKey):
+            action = self.getActionByKey(key)
+            if action is not None and action.defaultWidget().isRemovable:
+                if self.currentKey == key:
+                    self.currentKey = None
+                self.removeAction(action)
+                action.deleteLater()
 
     def addSimpleAction(self, name, actName, actionMethod, isNoDotLabel=True, isNoButtons=True):
         action = QWidgetAction(self)
@@ -2933,7 +2943,7 @@ class MyPlotDock(QgsDockWidget):
         )
         for key in self.travelers.getKeys():
             if self.travelers.getData(key) is not None:
-                self.travelerMenu.addBioMetrics(
+                self.travelerMenu.addComplexAction(
                     self.travelers.getData(key)['name'],
                     key,
                     self.selectTraveler,
@@ -2951,7 +2961,6 @@ class MyPlotDock(QgsDockWidget):
         self.btnBodyMetrics.setEnabled(True)
         toolBar.addWidget(self.btnBodyMetrics)
 
-        """
         # 3. Creating a Profile Selection item for loading saved profiles
         self.btnProfileSelect = QToolButton()
         self.btnProfileSelect.setAutoRaise(True)
@@ -2960,31 +2969,28 @@ class MyPlotDock(QgsDockWidget):
         icon = QIcon(iconPath)
         self.btnProfileSelect.setIcon(icon)
         self.btnProfileSelect.setPopupMode(QToolButton.InstantPopup)
-        self.selectProfileMenu = QMenu(self)
+        # self.selectProfileMenu = QMenu(self)
+        self.selectProfileMenu = SelectableMenu(self)
         self.profileSeparator = self.selectProfileMenu.addSeparator()
-        actionDeleteProfiles = self.addSimpleAction(
-            self.selectProfileMenu,
+        self.selectProfileMenu.addSimpleAction(
             'Delete all profiles',
             'actionDeleteProfiles',
             self.deleteProfiles,
             isNoDotLabel=False,
             isNoButtons=False
         )
-        self.selectProfileMenu.addAction(actionDeleteProfiles)
-        self.profileActionGroup = {}
-        profileList = self.smartProfile.getProfileNames()
-        print(f'Init: profileList = {profileList}')
-        self.btnProfileSelect.setEnabled(False)
-        if profileList:
-            for key, name in profileList.items():
-                self.addMenuProfile(name, key)
-            self.btnProfileSelect.setMenu(self.selectProfileMenu)
-            self.btnProfileSelect.setEnabled(True)
-            currId = self.smartProfile.getCurrentProfileId()
-            if currId not in profileList:
-                self.smartProfile.unselectProfiles()
-            elif not self.selectProfile(self.profileActionGroup[currId]):
-                self.smartProfile.unselectProfiles()
+        # self.profileActionGroup = {}
+        isAnyProfile = len(self.smartProfile.getProfileNames()) > 0
+        self.btnProfileSelect.setEnabled(isAnyProfile)
+        for key, name in self.smartProfile.getProfileNames().items():
+            self.selectProfileMenu.addComplexAction(
+                name,
+                key,
+                self.selectProfile,
+                self.removeProfile
+            )
+        self.selectProfile(self.smartProfile.getCurrentProfileId())
+        self.btnProfileSelect.setMenu(self.selectProfileMenu)
         toolBar.addWidget(self.btnProfileSelect)
 
         # 4. Edit the current profile
@@ -2995,7 +3001,6 @@ class MyPlotDock(QgsDockWidget):
         self.editProfileAction.setEnabled(self.smartProfile.isDistances)
         self.editProfileAction.triggered.connect(self.editProfile)
         toolBar.addAction(self.editProfileAction)
-        """
 
         # self.actionSnap = QAction("Disallow snapping", self)
         # self.actionSnap.setIcon(QgsApplication.instance().getThemeIcon("mIconSnapping.svg"))
@@ -3087,34 +3092,14 @@ class MyPlotDock(QgsDockWidget):
         # First launching
         # QTimer.singleShot(100, self.renderBackground)
 
-    def addMenuProfile(self, name, key):
-        action = QWidgetAction(self.selectProfileMenu)
-        widget = SelectableMenuWidget(name, isEdited=True, isDeleted=True)
-        action.setDefaultWidget(widget)
-        action.setData(key)
-        widget.deleteRequested.connect(lambda: self.removeProfile(action))
-        widget.editRequested.connect(lambda: print(f'Editing: {name}'))
-        widget.selected.connect(lambda: self.selectProfile(action))
-        self.profileActionGroup[key] = action
-        # Inserting BEFORE the separator
-        self.selectProfileMenu.insertAction(self.profileSeparator, action)
-        return action
-
-    def selectProfile(self, action):
+    def selectProfile(self, key):
         try:
-            key = action.data()
-            currId = self.smartProfile.getCurrentProfileId()
             if not self.smartProfile.setCurrentProfile(key):
                 return False
             newViewRect = self.smartProfile.getViewRect()
             if newViewRect is not None:
                 self.viewRect = newViewRect
-                # Unselect the current selected profile menu
-                if currId and currId in self.profileActionGroup:
-                    widget = self.profileActionGroup[currId].defaultWidget()
-                    widget.setSelected(False)
-                widget = action.defaultWidget()
-                widget.setSelected(True)
+                self.selectProfileMenu.selectAction(key)
                 QTimer.singleShot(100, self.renderBackground)
                 return True
             else:
@@ -3126,6 +3111,8 @@ class MyPlotDock(QgsDockWidget):
             return False
 
     def deleteProfiles(self):
+        if len(self.smartProfile.getProfileNames()) == 0:
+            return
         reply = QMessageBox.question(
             None,
             'Confirmation',
@@ -3136,20 +3123,14 @@ class MyPlotDock(QgsDockWidget):
         )
         if reply == QMessageBox.Yes:
             self.smartProfile.clearAllProfiles()
-            for action in self.profileActionGroup.values():
-                self.selectProfileMenu.removeAction(action)
-                action.deleteLater()
-            self.profileActionGroup.clear()
+            for key in self.selectProfileMenu.getRemovableKeys():
+                self.selectProfileMenu.deleteRemovableAction(key)
             self.btnProfileSelect.setEnabled(False)
             self.editProfileAction.setEnabled(False)
             self.viewRect = self.initViewRect
             QTimer.singleShot(100, self.renderBackground)
-            return True
-        else:
-            return False
 
-    def removeProfile(self, action):
-        key = action.data()
+    def removeProfile(self, key):
         reply = QMessageBox.question(
             None,
             'Confirmation',
@@ -3161,19 +3142,15 @@ class MyPlotDock(QgsDockWidget):
         if reply == QMessageBox.Yes:
             currId = self.smartProfile.getCurrentProfileId()
             res = self.smartProfile.removeProfile(key)
-            if key in self.profileActionGroup:
-                self.selectProfileMenu.removeAction(action)
-                action.deleteLater()
-                del self.profileActionGroup[key]
-                if len(self.profileActionGroup) == 0:
+            isEmpty = len(self.smartProfile.getProfileNames()) == 0
+            if res:
+                if key == currId or isEmpty:
+                    self.viewRect = self.initViewRect
+                    QTimer.singleShot(100, self.renderBackground)
+                self.selectProfileMenu.deleteRemovableAction(key)
+                if isEmpty:
                     self.btnProfileSelect.setEnabled(False)
                     self.editProfileAction.setEnabled(False)
-            if key == currId or len(self.profileActionGroup) == 0:
-                self.viewRect = self.initViewRect
-                QTimer.singleShot(100, self.renderBackground)
-            return res
-        else:
-            return False
 
     def getDPR(self):
         viewport = self.canvas.viewport()
@@ -3217,7 +3194,7 @@ class MyPlotDock(QgsDockWidget):
                 data = travelerDataFrame.getData()
                 travelerId = self.travelers.createData(data)
                 if travelerId is not None:
-                    self.travelerMenu.addBioMetrics(
+                    self.travelerMenu.addComplexAction(
                         data['name'],
                         travelerId,
                         self.selectTraveler,
@@ -3529,8 +3506,13 @@ class MyPlotDock(QgsDockWidget):
             if newProfileId is not None:
                 print('New profile has been created.')
                 name = self.smartProfile.getProfileNames()[newProfileId]
-                action = self.addMenuProfile(name, newProfileId)
-                self.selectProfile(action)
+                self.selectProfileMenu.addComplexAction(
+                    name,
+                    newProfileId,
+                    self.selectProfile,
+                    self.removeProfile
+                )
+                self.selectProfile(newProfileId)
                 self.btnProfileSelect.setMenu(self.selectProfileMenu)
                 self.btnProfileSelect.setEnabled(True)
                 self.editProfileAction.setEnabled(True)
