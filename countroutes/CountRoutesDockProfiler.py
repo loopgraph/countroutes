@@ -347,33 +347,27 @@ class NameManager:
 
     def editName(self, oldFormattedName, newName, key, noName='NoName'):
         if key not in self.resultDict:
-            print(f"Ошибка: Ключ '{key}' не найден.")
-            return False
-
+            # print(f"Ошибка: Ключ '{key}' не найден.")
+            return None
         cleanedNewName = self._clean(newName)
         if not cleanedNewName and noName:
             cleanedNewName = noName
         elif not cleanedNewName:
-            return False
-
+            return None
         oldCleanedName, oldSuffixNum = self._parseFormattedName(oldFormattedName)
         self.nameRegistry[oldCleanedName].discard(oldSuffixNum)
-
         # 2. Ищем свободный номер для нового имени в словаре
         if cleanedNewName not in self.nameRegistry:
             self.nameRegistry[cleanedNewName] = set()
-
         busyNumbers = self.nameRegistry[cleanedNewName]
         newSuffixNum = 0
         while newSuffixNum in busyNumbers:
             newSuffixNum += 1
-
         # 3. Фиксируем новый номер и обновляем список на том же месте
         busyNumbers.add(newSuffixNum)
         formattedNewName = cleanedNewName if newSuffixNum == 0 else f"{cleanedNewName}({newSuffixNum})"
-
         self.resultDict[key] = formattedNewName
-        return True
+        return self.resultDict[key]
 
     def clearAllNames(self):
         self.resultDict = {}
@@ -479,6 +473,37 @@ class BodyMetrics:
             return bodyMetricsKey
         return None
 
+    def saveData(self, bodyMetricsKey, data):
+        """
+        Saving edited body metrics data with traveler bodyMetricsKey
+        :param:
+        bodyMetricsKey: str
+        data: = {
+            'name': str,
+            'age': int,
+            'gender': bool,
+            'weight': float,
+            'height': int,
+            'speed': float,
+            'cargo': float }
+        :return: bodyMetricsKey or None
+        """
+        if self.isBodyMetricsAvailable(data):
+            data['id'] = bodyMetricsKey
+            oldName = self.getName(bodyMetricsKey)
+            print(f'saveData: oldName = {oldName}')
+            if not oldName:
+                return None
+            print(f'saveData: newName = {data["name"]}')
+            if oldName != data['name']:
+                newName = self.names.editName(oldName, data['name'], bodyMetricsKey)
+                if newName is not None:
+                    data['name'] = newName
+            self.bodyMetricsData[bodyMetricsKey] = data
+            self.settings.setValue(self.settingsPath, self.bodyMetricsData)
+            return bodyMetricsKey
+        return None
+
     def isBodyMetricsAvailable(self, data):
         keys = ["name", "gender", "age", "weight", "height", "speed", "cargo"]
         if not isinstance(data, dict) or not all(k in keys for k in data):
@@ -497,16 +522,6 @@ class BodyMetrics:
                 self.bodyMetricsLimits['speed'][0] <= float(data['speed']) <= self.bodyMetricsLimits['speed'][1] and
                 self.bodyMetricsLimits['cargo'][0] <= float(data['cargo']) <= self.bodyMetricsLimits['cargo'][1]
         )
-
-    def editData(self, bodyMetricsKey, data):
-        if not (bodyMetricsKey in self.bodyMetricsData):
-            return False
-        if self.isBodyMetricsAvailable(data):
-            if self.names.editName(self.bodyMetricsData[bodyMetricsKey]['name'], data['name'], bodyMetricsKey):
-                data['name'] = self.names.getNames()[bodyMetricsKey]
-                self.bodyMetricsData[bodyMetricsKey] = data
-                return True
-        return False
 
     def removeData(self, bodyMetricsKey):
         try:
@@ -605,10 +620,10 @@ class TrackCacheManager:
                 trackId = self.settings.value(f'{self.settingsPrefix}_last_active_track_id', '')
                 if not trackId:
                     return None
-            settingsKey = f"{self.settingsPrefix}_tracks/{trackId}"
-            filePath = self.settings.value(settingsKey, "")
+            settingsKey = f'{self.settingsPrefix}_tracks/{trackId}'
+            filePath = self.settings.value(settingsKey, '')
             if not filePath or not os.path.exists(filePath):
-                print(f"Cache file for UUID {trackId} not found on disk")
+                # print(f"Cache file for UUID '{trackId}' not found on disk")
                 return None
             if self.validateNpzDict(filePath, self.profileTypeCheck):
                 with np.load(filePath) as data:
@@ -2326,23 +2341,25 @@ class SelectableMenu(QMenu):
 
     def getRemovableKeys(self):
         return [action.data() for action in self.actions()
-                if (
-                        isinstance(action, QWidgetAction) and
-                        isinstance(action.defaultWidget(), SelectableMenuWidget) and
-                        action.defaultWidget().isRemovable
-                )
-        ]
+                    if (
+                            isinstance(action, QWidgetAction) and
+                            isinstance(action.defaultWidget(), SelectableMenuWidget) and
+                            action.defaultWidget().isRemovable
+                    )
+                ]
 
-    def addComplexAction(self, name, key, selectMethod, removeMethod):
+    def addComplexAction(self, name, key, selectMethod, removeMethod, editMethod=None):
+        isEdited = False if editMethod is None else True
         if self.defaultKey is not None and key == self.defaultKey:
-            widget = SelectableMenuWidget(name, isEdited=True)
+            widget = SelectableMenuWidget(name, isEdited=isEdited)
         else:
-            widget = SelectableMenuWidget(name, isEdited=True, isDeleted=True, isRemovable=True)
+            widget = SelectableMenuWidget(name, isEdited=isEdited, isDeleted=True, isRemovable=True)
         action = QWidgetAction(self)
         action.setDefaultWidget(widget)
         action.setData(key)
         widget.deleteRequested.connect(lambda: removeMethod(key))
-        widget.editRequested.connect(lambda: print(f"Редактируем: {name}"))
+        if isEdited:
+            widget.editRequested.connect(lambda: editMethod(key))
         widget.selected.connect(lambda: selectMethod(key))
         if self.softSeparator is not None and isinstance(self.softSeparator, QAction):
             self.insertAction(self.softSeparator, action)
@@ -2363,6 +2380,14 @@ class SelectableMenu(QMenu):
             widget = action.defaultWidget()
             widget.setSelected(True)
             self.currentKey = key
+
+    def renameAction(self, key, newName):
+        action = self.getActionByKey(key)
+        if action is not None:
+            widget = action.defaultWidget()
+            print(f'renameAction: old name = {widget.label.text()}, get new = {newName}')
+            widget.label.setText(newName)
+            print(f'renameAction: new name = {widget.label.text()}')
 
     def deleteRemovableAction(self, key):
         if key is not None and (self.defaultKey is None or key != self.defaultKey):
@@ -2948,7 +2973,8 @@ class MyPlotDock(QgsDockWidget):
                     self.travelers.getData(key)['name'],
                     key,
                     self.selectTraveler,
-                    self.removeTraveler
+                    self.removeTraveler,
+                    self.editTraveler
                 )
         self.selectTraveler(self.travelers.getCurrentKey())
         self.btnBodyMetrics = QToolButton()
@@ -3199,9 +3225,46 @@ class MyPlotDock(QgsDockWidget):
                         data['name'],
                         travelerId,
                         self.selectTraveler,
-                        self.removeTraveler
+                        self.removeTraveler,
+                        self.editTraveler
                     )
                     self.selectTraveler(travelerId)
+            except:
+                ex = "{0}".format(traceback.format_exc())
+                msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
+                print(f' renderBackground {msg}')
+        dlg.deleteLater()
+
+    def editTraveler(self, key):
+        dlg = QDialog()
+        dlg.setWindowTitle("Edit Traveler Body Metrics")
+        dlg.resize(300, 400)
+        layout = QVBoxLayout(dlg)
+        travelerData = self.travelers.getData(key)
+        if travelerData is None:
+            return
+        print(f'editTraveler: name = {travelerData["name"]}')
+        travelerDataFrame = TravelerEdit(
+            travelerData,
+            self.travelers.getLimits()
+        )
+        layout.addWidget(travelerDataFrame)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        canvas = iface.mapCanvas()
+        topLeftScreenPoint = canvas.mapToGlobal(canvas.pos())
+        dlg.move(topLeftScreenPoint)
+        if dlg.exec() == QDialog.Accepted:
+            try:
+                data = travelerDataFrame.getData()
+                print(f'editTraveler: new name = {data["name"]}')
+                resId = self.travelers.saveData(key, data)
+                if resId is None:
+                    return
+                self.travelerMenu.renameAction(key, data['name'])
+                self.selectTraveler(key)
             except:
                 ex = "{0}".format(traceback.format_exc())
                 msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
