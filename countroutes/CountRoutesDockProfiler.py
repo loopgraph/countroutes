@@ -49,7 +49,9 @@ class Typography:
     maxTextX: str = "100000.00 m"
     gridTextFormatY: str = "{:.1f}"
     maxTextY: str = "9000.00 m"
+    maxTextYDialog: str = "9000.00 m (Orig.: -9000.00 m, Ext.: -9000.00 m)"
     maxTextG: str = "-00.00 °"
+    maxTextGDialog: str = "-00.00 ° (Orig.: -00.00 °, Ext.: -00.00 °)"
     maxTextE: str = "10000000.00 kcal"
     maxTextC: str = "2400.00 kcal"
     maxTextF: str = "1000.00 ml"
@@ -113,6 +115,7 @@ class Typography:
     etaData: dict = field(init=False)
     style2: str = field(init=False)
     curveColors: dict = field(init=False)
+    profileTypeNames: dict = field(init=False)
 
     def __post_init__(self):
         # Font settings for coordinate labels
@@ -143,6 +146,12 @@ class Typography:
             QLabel#Value {{
                 font-family: 'Consolas', 'Monospace';
                 font-size: {self.infoValueFontSize}px; 
+                min-height: 22px;
+                color: #2c3e50; /* Deep dark blue/gray */
+            }}
+            QLabel#DialogValue {{
+                font-family: 'Consolas', 'Monospace';
+                font-size: {self.infoTitleFontSize}px; 
                 min-height: 22px;
                 color: #2c3e50; /* Deep dark blue/gray */
             }}
@@ -253,6 +262,20 @@ class Typography:
             'original': QColor(0, 100, 200),
             'external': QColor(252, 61, 33),
             'dem': QColor(77, 182, 172)
+        }
+        self.profileTypeNames = {
+            'original': {
+                'full': 'Original',
+                'short': 'Orig.'
+            },
+            'external': {
+                'full': 'External',
+                'short': 'Ext.'
+            },
+            'dem': {
+                'full': 'DEM',
+                'short': 'DEM'
+            }
         }
 
 
@@ -869,15 +892,15 @@ class SmartProfile(QObject):
         #
         # self.profiles = None
 
-    def setProfileOrderStack(self, name):
-        if name is not None and name in self.profileOrderStack:
-            self.profileOrderStack.remove(name)
-            self.profileOrderStack.appendleft(name)
-            actionName = name
+    def setProfileOrderStack(self, key):
+        if key is not None and key in self.profileOrderStack:
+            self.profileOrderStack.remove(key)
+            self.profileOrderStack.appendleft(key)
+            resKey = key
         else:
             self.profileOrderStack = deque(['original', 'external', 'dem'])
-            actionName = 'original'
-        return actionName
+            resKey = 'original'
+        return resKey
 
     def isProfileVisible(self, name):
         return name in self.visibleProfiles and self.visibleProfiles[name]
@@ -1490,28 +1513,45 @@ class SmartProfile(QObject):
 
     def getConstructedData(self, currentX):
         if self.isDistances:
-            name = next((key for key in self.profileOrderStack if self.visibleProfiles.get(key)), None)
-            if name is not None:
-                return (
+            # name = next((key for key in self.profileOrderStack if self.visibleProfiles.get(key)), None)
+            resGen = (
+                (
+                    key,
                     np.interp(
                         currentX,
                         self.currentProfile['distances'],
-                        {
-                            'original': self.currentProfile['eles'],
-                            'external': self.extElevations['external'],
-                            'dem': self.extElevations['dem']
-                        }[name]
+                        self.currentProfile['eles'] if key == 'original' else self.extElevations[key]
                     ),
                     np.interp(
                         currentX,
                         self.currentProfile['distances'],
-                        {
-                            'original': self.currentProfile['grads'],
-                            'external': self.extGradients['external'],
-                            'dem': self.extGradients['dem']
-                        }[name]
+                        self.currentProfile['grads'] if key == 'original' else self.extGradients[key]
                     )
-                )
+                ) for key in self.profileOrderStack
+                if (key in self.extElevations and self.extElevations[key] is not None or
+                    key == 'original')
+            )
+            return resGen
+            #     return (
+            #         np.interp(
+            #             currentX,
+            #             self.currentProfile['distances'],
+            #             {
+            #                 'original': self.currentProfile['eles'],
+            #                 'external': self.extElevations['external'],
+            #                 'dem': self.extElevations['dem']
+            #             }[name]
+            #         ),
+            #         np.interp(
+            #             currentX,
+            #             self.currentProfile['distances'],
+            #             {
+            #                 'original': self.currentProfile['grads'],
+            #                 'external': self.extGradients['external'],
+            #                 'dem': self.extGradients['dem']
+            #             }[name]
+            #         )
+            #     )
         return None
 
     # @staticmethod
@@ -1587,12 +1627,12 @@ class SmartProfile(QObject):
     #     return path
 
     def getPainterElevationPath(self,
-                                viewRect,  # The rectangle with coordinates (minX, minY) (maxX, maxY)
-                                indent,  # Indents between canvas edges and the graph array
-                                dataViewSize,  # The size of the graph array
-                                isAxisRatioLocked=True,
-                                isEdited=False
-                                ):
+        viewRect,  # The rectangle with coordinates (minX, minY) (maxX, maxY)
+        indent,  # Indents between canvas edges and the graph array
+        dataViewSize,  # The size of the graph array
+        isAxisRatioLocked=True,
+        isEdited=False
+    ):
         if not self.isDistances:
             return None
         # Generates a path for QPainter.
@@ -1673,7 +1713,7 @@ class SmartProfile(QObject):
             return None
 
         if not isEdited:
-            return createPath('original')
+            return createPath('original') if self.isProfileVisible('original') else None
         else:
             res = {}
             for name in self.profileOrderStack:
@@ -1681,7 +1721,7 @@ class SmartProfile(QObject):
                     paintedPath = createPath(name)
                     if paintedPath is not None:
                         res[name] = paintedPath
-            return res
+            return res if res else None
 
     def getExtElevations(self, name):
         return self.extElevations[name] if name in self.extElevations else None
@@ -1786,7 +1826,7 @@ class RouteReport:
 
 class PlotInteraction(QObject):
     # Managing native C++ scene elements (without overriding Python paint)
-    showInfoDisplayData = pyqtSignal(object)
+    showInfoDisplayData = pyqtSignal(str, str, str, str, str, str, str)
     setSelection = pyqtSignal(float, float)
     selectionUnavailable = pyqtSignal()
 
@@ -1808,15 +1848,6 @@ class PlotInteraction(QObject):
         self.gsd = None  # Ground Sample Distance
         self.xRealOffset = None
         self.yRealOffset = None
-        self.infoDisplayData = {
-            'distance': '',
-            'elevation': '',
-            'gradient': '',
-            'energy': '',
-            'temperature': '',
-            'humidity': '',
-            'eta': ''
-        }
         self.minimalSelectionWidth = 2
         # 1) Background (curve and grid)
         self.background = QGraphicsPixmapItem()
@@ -1948,27 +1979,30 @@ class PlotInteraction(QObject):
                 not dataViewSize.height() or
                 self.gsd is None or not self.smartProfile.isDistances):
             self.hideCursor()
+            self.showInfoDisplayData.emit(*([''] * 7))
             return
         # Calculating real coordinates relative to a logical data rectangle
         # realX = viewRect.left() + ((scenePos.x() - indent.left) / dataViewSize.width()) * viewRect.width()
         realX = self.xRealOffset + scenePos.x() * self.gsd
         if realX - viewRect.left() < 0:
             self.hideCursor()
+            self.showInfoDisplayData.emit(*([''] * 7))
             return
         y = scenePos.y()
         hideOnlyY = False
 
         realY, gradInPercents = self.smartProfile.getProfileData(realX)
         if realY is None:
-            self.hideCursor(True)
-            self.infoDisplayData['distance'] = self.typo.distanceTextFormatInfo.format(realX)
-            self.infoDisplayData['elevation'] = ''
-            self.infoDisplayData['gradient'] = ''
-            self.infoDisplayData['energy'] = ''
-            self.infoDisplayData['temperature'] = ''
-            self.infoDisplayData['humidity'] = ''
-            self.infoDisplayData['eta'] = ''
-            self.showInfoDisplayData.emit(self.infoDisplayData)
+            self.hideCursor(hideOnlyY=True)
+            self.showInfoDisplayData.emit(
+                self.typo.distanceTextFormatInfo.format(realX),     # distance
+                '',                                                 # elevation
+                '',                                                 # gradient
+                '',                                                 # energy
+                '',                                                 # temperature
+                '',                                                 # humidity
+                ''                                                  # eta
+            )
             return
 
         if self.snapping:
@@ -2042,13 +2076,8 @@ class PlotInteraction(QObject):
         # print(f'gradInfo = {gradInfo}, energyInfo = {energyInfo}')
         if hideOnlyY:
             self.hideCursor(hideOnlyY)
-            self.infoDisplayData['distance'] = distInfo
-            self.infoDisplayData['elevation'] = ''
-            self.infoDisplayData['gradient'] = ''
-            self.infoDisplayData['energy'] = energyInfo
-            self.infoDisplayData['temperature'] = tempInfo
-            self.infoDisplayData['humidity'] = rhInfo
-            self.infoDisplayData['eta'] = etaInfo
+            elevInfo = ''
+            gradInfo = ''
         else:
             if not self.vLine.isVisible():
                 for i in [self.vLine, self.labelX]:
@@ -2056,14 +2085,15 @@ class PlotInteraction(QObject):
             if not self.hLine.isVisible():
                 for i in [self.hLine, self.labelY]:
                     i.setVisible(True)
-            self.infoDisplayData['distance'] = distInfo
-            self.infoDisplayData['elevation'] = elevInfo
-            self.infoDisplayData['gradient'] = gradInfo
-            self.infoDisplayData['energy'] = energyInfo
-            self.infoDisplayData['temperature'] = tempInfo
-            self.infoDisplayData['humidity'] = rhInfo
-            self.infoDisplayData['eta'] = etaInfo
-        self.showInfoDisplayData.emit(self.infoDisplayData)
+        self.showInfoDisplayData.emit(
+            distInfo,       # distance
+            elevInfo,       # elevation
+            gradInfo,       # gradient
+            energyInfo,     # energy
+            tempInfo,       # temperature
+            rhInfo,         # humidity
+            etaInfo         # eta
+        )
         # self.canvas.viewport().update()
 
     def moveDialogCursor(self, scenePos, viewRect, dataViewSize):
@@ -2072,17 +2102,47 @@ class PlotInteraction(QObject):
                 not dataViewSize.height() or
                 self.gsd is None or not self.smartProfile.isDistances):
             self.hideCursor()
+            self.showInfoDisplayData.emit(*([''] * 7))
             return
         # Calculating real coordinates relative to a logical data rectangle
         realX = self.xRealOffset + scenePos.x() * self.gsd
         if realX - viewRect.left() < 0:
             self.hideCursor()
+            self.showInfoDisplayData.emit(*([''] * 7))
             return
         y = scenePos.y()
         hideOnlyY = False
 
-        realY, gradInPercents = self.smartProfile.getConstructedData(realX)
-
+        # realY, gradInPercents = self.smartProfile.getConstructedData(realX)
+        generator = self.smartProfile.getConstructedData(realX)
+        (firstProfileType, realY, gradInPercents) = next(generator, (None, None, None))
+        if (
+                firstProfileType is None or
+                # firstProfileKey not in self.smartProfile.visibleProfiles or
+                not self.smartProfile.visibleProfiles[firstProfileType]
+        ):
+            self.hideCursor()
+            self.showInfoDisplayData.emit(*([''] * 7))
+            return
+        elevDiffs = gradDiffs = ''
+        for (profileType, elev, grad) in generator:
+            elevDiffs += (
+                f'{self.typo.profileTypeNames[profileType]["short"]}: '
+                f'{"+" if elev - realY > 0 else ""}'
+                f'{self.typo.elevationTextFormatInfo.format(elev - realY)}, '
+            )
+            gradDiffs += (
+                f'{self.typo.profileTypeNames[profileType]["short"]}: '
+                f'{"+" if grad - gradInPercents > 0 else ""}'
+                '{}, '.format(
+                    self.typo.gradientPTextFormatInfo.format(grad - gradInPercents)
+                    if not self.smartProfile.isGradInDegrees()
+                    else self.typo.gradientDTextFormatInfo.format(np.degrees(np.arctan((grad - gradInPercents) / 100)))
+                )
+            )
+        if elevDiffs:
+            elevDiffs = f'({elevDiffs[:-2]})'
+            gradDiffs = f'({gradDiffs[:-2]})'
         if self.snapping:
             if self.isAxisRatioLocked:
                 # y = int((viewRect.bottom() - realY) / self.gsd)     # snapped & locked
@@ -2127,7 +2187,7 @@ class PlotInteraction(QObject):
             self.labelY.setPos(sRect.left() + offset - 1, y - yTextHeight - 2 * offset)
 
         # surfaceType = next((v['name'] for k, v in self.typo.etaData.items() if k == eta), '')
-        distInfo, elevInfo, gradInfo, = (
+        distInfo, elevInfo, gradInfo = (
             self.typo.distanceTextFormatInfo.format(realX),
             self.typo.elevationTextFormatInfo.format(realY),
             self.typo.gradientPTextFormatInfo.format(gradInPercents)
@@ -2137,9 +2197,8 @@ class PlotInteraction(QObject):
         # print(f'gradInfo = {gradInfo}, energyInfo = {energyInfo}')
         if hideOnlyY:
             self.hideCursor(hideOnlyY)
-            self.infoDisplayData['distance'] = distInfo
-            self.infoDisplayData['elevation'] = ''
-            self.infoDisplayData['gradient'] = gradInfo
+            elevInfo = ''
+            gradInfo = ''
         else:
             if not self.vLine.isVisible():
                 for i in [self.vLine, self.labelX]:
@@ -2147,13 +2206,15 @@ class PlotInteraction(QObject):
             if not self.hLine.isVisible():
                 for i in [self.hLine, self.labelY]:
                     i.setVisible(True)
-            self.infoDisplayData['distance'] = distInfo
-            self.infoDisplayData['elevation'] = elevInfo
-            self.infoDisplayData['gradient'] = gradInfo
-            self.infoDisplayData['temperature'] = ''
-            self.infoDisplayData['humidity'] = ''
-            self.infoDisplayData['eta'] = ''
-        self.showInfoDisplayData.emit(self.infoDisplayData)
+        self.showInfoDisplayData.emit(
+            distInfo,       # distance
+            elevInfo + elevDiffs,       # elevation
+            gradInfo + gradDiffs,       # gradient
+            '',             # energy
+            '',             # temperature
+            '',             # humidity
+            ''              # eta
+        )
         # self.canvas.viewport().update()
 
     def hideCursor(self, hideOnlyY=False):
@@ -2166,14 +2227,6 @@ class PlotInteraction(QObject):
         else:
             for item in [self.vLine, self.hLine, self.labelX, self.labelY]:
                 item.setVisible(False)
-            self.infoDisplayData['distance'] = ''
-            self.infoDisplayData['elevation'] = ''
-            self.infoDisplayData['gradient'] = ''
-            self.infoDisplayData['energy'] = ''
-            self.infoDisplayData['temperature'] = ''
-            self.infoDisplayData['humidity'] = ''
-            self.infoDisplayData['eta'] = ''
-            self.showInfoDisplayData.emit(self.infoDisplayData)
 
 
 class CanvasFilter(QObject):
@@ -2365,6 +2418,36 @@ class SelectableMenu(QMenu):
             self.insertAction(self.softSeparator, action)
         else:
             self.addAction(action)
+
+    def addProfileSourceAction(self, name, key, selectMethod, dpr,
+                               isVisible=True,
+                               setVisibleMethod=None,
+                               isProcessing=False,
+                               processMethod=None):
+        action = QWidgetAction(self)
+        if isProcessing and processMethod is None:
+            isProcessing = False
+        widget = SelectableMenuWidget(
+            name,
+            isEdited=False,
+            isDeleted=False,
+            isToShow=True,
+            isVisible=isVisible,
+            isProcessing=isProcessing,
+            isNoButtons=False,
+            isNoDotLabel=False,
+            color=None,
+            dpr=dpr,
+            isSelectable=True
+        )
+        action.setDefaultWidget(widget)
+        action.setData(key)
+        widget.selected.connect(lambda: selectMethod(key))
+        if setVisibleMethod is not None:
+            widget.showRequested.connect(lambda visible: setVisibleMethod(key, visible))
+        if isProcessing:
+            widget.processing.connect(lambda: processMethod(widget))
+        self.addAction(action)
 
     def selectAction(self, key):
         if self.currentKey is not None and key == self.currentKey:
@@ -3083,7 +3166,7 @@ class MyPlotDock(QgsDockWidget):
         layout.addWidget(toolBar)
         layout.addWidget(self.canvas)
         self.infoDisplay = InfoDisplay(self.plotUI.typo)
-        self.plotUI.showInfoDisplayData.connect(self.infoDisplay.updateData)
+        self.plotUI.showInfoDisplayData.connect(self.infoDisplay.updateInfoDisplayData)
         layout.addWidget(self.infoDisplay)
         # layout.addStretch()
         widgetContainer.setLayout(layout)
@@ -3835,13 +3918,25 @@ class MountProfileDialog(QDialog):
         icon = QIcon(iconPath)
         profileChoiceBtn.setIcon(icon)
         profileChoiceBtn.setPopupMode(QToolButton.InstantPopup)
-        self.profileChoiceMenu = QMenu(self)
-        action = self.addProfileSourceAction('Current Elevations', 'original', True, False)
-        self.profileChoiceMenu.addAction(action)
-        action = self.addProfileSourceAction('External Source', 'external', False, True)
-        widget = action.defaultWidget()
-        widget.processing.connect(lambda: self.runLoadingExternalProfile(widget))
-        self.profileChoiceMenu.addAction(action)
+        # self.profileChoiceMenu = QMenu(self)
+        self.profileChoiceMenu = SelectableMenu(self)
+        self.profileChoiceMenu.addProfileSourceAction(
+            'Current Elevations',
+            'original',
+            self.selectProfileData,
+            self.getDPR(),
+            setVisibleMethod=self.setProfileVisible
+        )
+        self.profileChoiceMenu.addProfileSourceAction(
+            'External Source',
+            'external',
+            self.selectProfileData,
+            self.getDPR(),
+            isVisible=False,
+            setVisibleMethod=self.setProfileVisible,
+            isProcessing=True,
+            processMethod=self.runLoadingExternalProfile
+        )
         # action = self.addProfileSourceAction('DEM File', 'dem', False, False)
         # self.profileChoiceMenu.addAction(action)
         profileChoiceBtn.setMenu(self.profileChoiceMenu)
@@ -3870,15 +3965,15 @@ class MountProfileDialog(QDialog):
         layout.setSpacing(0)
         layout.addWidget(toolBar)
         layout.addWidget(self.canvas, stretch=1)
-        """
         self.conditionsDisplay = ConditionsDisplay(self.plotUI.typo, self.getDPR())
-        self.plotUI.showInfoDisplayData.connect(self.conditionsDisplay.updateData)
+        self.plotUI.showInfoDisplayData.connect(self.conditionsDisplay.updateEditProfileData)
+        layout.addWidget(self.conditionsDisplay)
+        """
         self.plotUI.setSelection.connect(self.setSelection)
         self.plotUI.selectionUnavailable.connect(self.setSelectionUnavailable)
         self.selectionStart = None
         self.selectionEnd = None
         self.isSelectionAvailable = False
-        layout.addWidget(self.conditionsDisplay)
 
         tempLimits = self.smartProfile.mbModule.TEMPERATURES_LIMIT
         rhLimits = self.smartProfile.mbModule.HUMIDITY_LIMIT
@@ -3965,6 +4060,10 @@ class MountProfileDialog(QDialog):
         self.thread = None
         self.worker = None
         self.selectProfileData()
+
+    def setProfileVisible(self, key, isVisible):
+        self.smartProfile.setProfileVisible(key, isVisible)
+        QTimer.singleShot(100, self.renderDialogBackground)
 
     def runLoadingExternalProfile(self, widget):
         print('Checking for internet connectivity ...')
@@ -4087,42 +4186,15 @@ class MountProfileDialog(QDialog):
                  "Please select an area using the mouse with the left button pressed.")
             )
 
-    def selectProfileData(self, action=None):
+    def selectProfileData(self, key=None):
         """
         Setting the order of profile curves,
         marking the higher profile in the choice menu and
         rendering the canvas.
-        :param action: QWidgetAction or None for initialization
-        :return:
         """
-        if action is None:
-            name = None
-        else:
-            name = action.objectName()
-        actionName = self.smartProfile.setProfileOrderStack(name)
-        for act in self.profileChoiceMenu.actions():
-            act.defaultWidget().setSelected(actionName == act.objectName())
+        key = self.smartProfile.setProfileOrderStack(key)
+        self.profileChoiceMenu.selectAction(key)
         QTimer.singleShot(100, self.renderDialogBackground)
-
-    def addProfileSourceAction(self, name, actName, isVisible, isProcessing):
-        action = QWidgetAction(self.profileChoiceMenu)
-        widget = SelectableMenuWidget(
-            name,
-            isEdited=False,
-            isDeleted=False,
-            isToShow=True,
-            isVisible=isVisible,
-            isProcessing=isProcessing,
-            isNoButtons=False,
-            isNoDotLabel=False,
-            color=None,
-            dpr=self.getDPR(),
-            isSelectable=True
-        )
-        action.setDefaultWidget(widget)
-        action.setObjectName(actName)
-        widget.selected.connect(lambda: self.selectProfileData(action))
-        return action
 
     def setSelection(self, xStart, xEnd):
         self.selectionStart = xStart
@@ -4374,11 +4446,12 @@ class MountProfileDialog(QDialog):
             isAxisRatioLocked=self.plotUI.isAxisRatioLocked,
             isEdited=True
         )
-        for pathName, path in paths.items():
-            if not path.isEmpty():
-                p.setRenderHint(QPainter.Antialiasing, True)
-                p.setPen(QPen(self.plotUI.typo.curveColors[pathName], 1.5))
-                p.drawPath(path)
+        if paths is not None:
+            for pathName, path in paths.items():
+                if not path.isEmpty():
+                    p.setRenderHint(QPainter.Antialiasing, True)
+                    p.setPen(QPen(self.plotUI.typo.curveColors[pathName], 1.5))
+                    p.drawPath(path)
         p.end()
         # Update the background and synchronize the scene size
         self.plotUI.updateBackground(QPixmap.fromImage(buffer))
@@ -4709,18 +4782,20 @@ class InfoDisplay(QFrame):
         # fm = QFontMetrics(font)
         # return fm.horizontalAdvance(sampleText) + 5
 
-    def updateData(self, data):
-        try:
-            self.distLabel.setText(data['distance'])
-            self.elevLabel.setText(data['elevation'])
-            self.gradLabel.setText(data['gradient'])
-            self.energyLabel.setText(data['energy'])
-
-        except:
-            pass
-            # ex = "{0}".format(traceback.format_exc())
-            # msg = "Unexpected ERROR:\n\n{0}".format(ex[:2000])
-            # print(f' renderBackground {msg}')
+    def updateInfoDisplayData(
+        self,
+        distInfo,  # distance
+        elevInfo,  # elevation
+        gradInfo,  # gradient
+        energyInfo,  # energy
+        tempInfo,  # temperature
+        rhInfo,  # humidity
+        etaInfo  # eta
+    ):
+        self.distLabel.setText(distInfo)
+        self.elevLabel.setText(elevInfo)
+        self.gradLabel.setText(gradInfo)
+        self.energyLabel.setText(energyInfo)
 
 
 class TravelerEdit(QFrame):
@@ -4881,22 +4956,33 @@ class ConditionsDisplay(QFrame):
         self.dpr = dpr
         self.setObjectName("DataPanel")
         self.setStyleSheet(self.typo.style2)
-        layout = QHBoxLayout(self)
-        layout.addStretch()
+        mainLayout = QVBoxLayout(self)
+        layout1 = QHBoxLayout(self)
+        layout1.addStretch()
         self.elevLabel = self._addBlock(
-            layout,
+            layout1,
             "Elevation",
             "",
-            self.typo.maxTextY
+            self.typo.maxTextYDialog
         )
+        self.gradLabel = self._addBlock(
+            layout1,
+            "Gradient",
+            "",
+            self.typo.maxTextGDialog
+        )
+        layout1.addStretch()
+        mainLayout.addLayout(layout1)
+        layout2 = QHBoxLayout(self)
+        layout2.addStretch()
         self.tempLabel = self._addBlock(
-            layout,
+            layout2,
             "Temperature",
             "",
             self.typo.maxTextT
         )
         self.humLabel = self._addBlock(
-            layout,
+            layout2,
             "Humidity",
             "",
             self.typo.maxTextH
@@ -4910,18 +4996,20 @@ class ConditionsDisplay(QFrame):
         self.surfMarker = QLabel()
         self.markerLayout.addWidget(self.surfMarker)
         self.surfLabel, hBlock = self._addBlock(
-            layout,
+            layout2,
             "Surface Type",
             "",
             self.typo.maxTextR,
             markerWidth=markerWidth
         )
         hBlock.addLayout(self.markerLayout)
-        layout.addStretch()
+        layout2.addStretch()
+        mainLayout.addLayout(layout2)
+        mainLayout.addStretch()
 
     def _addBlock(self, parentLayout, title, initialValue, textSample, markerWidth=None, isHidden=False):
         container = QFrame()
-        maxWidth = self.getOptimalWidth(title, self.typo.infoTitleFont, textSample, self.typo.infoValueFont)
+        maxWidth = self.getOptimalWidth(title, self.typo.infoTitleFont, textSample, self.typo.infoTitleFont)
         # if title == 'Humidity':
         #     print(f'maxWidth of Humidity field = {maxWidth}')
         block = QVBoxLayout(container)
@@ -4933,7 +5021,7 @@ class ConditionsDisplay(QFrame):
         tLbl.setAlignment(Qt.AlignCenter)
 
         vLbl = QLabel(initialValue)
-        vLbl.setObjectName("Value")
+        vLbl.setObjectName("DialogValue")
         vLbl.setAlignment(Qt.AlignCenter)
         block.addWidget(tLbl)
         hBlock = None
@@ -4958,17 +5046,27 @@ class ConditionsDisplay(QFrame):
         wValue = QFontMetrics(valueFont).horizontalAdvance(sampleText)
         return max(wTitle, wValue) + 5
 
-    def updateData(self, data):
+    def updateEditProfileData(
+            self,
+            distInfo,  # distance
+            elevInfo,  # elevation
+            gradInfo,  # gradient
+            energyInfo,  # energy
+            tempInfo,  # temperature
+            rhInfo,  # humidity
+            etaInfo  # eta
+    ):
         try:
-            self.elevLabel.setText(data['elevation'])
-            self.tempLabel.setText(data['temperature'])
-            self.humLabel.setText(data['humidity'])
-            self.surfLabel.setText(data['eta'])
+            self.elevLabel.setText(elevInfo)
+            self.gradLabel.setText(gradInfo)
+            self.tempLabel.setText(tempInfo)
+            self.humLabel.setText(rhInfo)
+            self.surfLabel.setText(etaInfo)
             if not self.markerLayout.isEmpty():
                 self.markerLayout.removeWidget(self.surfMarker)
                 self.surfMarker.hide()
-            if data['eta'] in self.markerDict:
-                self.surfMarker = self.markerDict[data['eta']]
+            if etaInfo in self.markerDict:
+                self.surfMarker = self.markerDict[etaInfo]
                 self.markerLayout.insertWidget(0, self.surfMarker)
                 self.surfMarker.show()
         except:
